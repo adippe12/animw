@@ -1,0 +1,25 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/adippe12/animw/builds/AnimeWorld.cs3",
+        "status": 1,
+        "version": 21,
+        "name": "AnimeWorld",
+        "internalName": "AnimeWorld",
+        "authors": [
+            "doGior",
+            "DieGon"
+        ],
+        "description": "Anime da AnimeWorld con logo PNG trasparente (AniList \u2192 ARM \u2192 TMDB).",
+        "fileSize": 66796,
+        "repositoryUrl": "https://github.com/adippe12/animw",
+        "language": "it",
+        "tvTypes": [
+            "AnimeMovie",
+            "Anime",
+            "OVA"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/DieGon7771/ItaliaInStreaming/master/AnimeWorld/animeworld_icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-c44788e669e74fa4b241471e4cfbffa446450e70694066f52b31a88c46f08a56"
+    }
+]
