@@ -2,7 +2,6 @@ package it.dogior.hadEnough
 
 import android.annotation.SuppressLint
 import android.content.Intent
-import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
@@ -50,10 +49,6 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
         "Coreano (ko)",
         "Cinese (zh)",
     )
-
-    /** Direct SharedPreferences handle — used for writes (PrefsHolder accessors are read-only). */
-    private val sharedPref: SharedPreferences?
-        get() = PrefsHolder.rawPrefs
 
     private fun View.makeTvCompatible() {
         this.setPadding(
@@ -165,24 +160,24 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
 
         // ---- Save button ----
         saveBtn?.setOnClickListener {
-            val sp = plugin.sharedPref ?: run {
+            val sp = PrefsHolder.rawPrefs
+            if (sp == null) {
                 showToast("Errore: SharedPreferences non disponibili")
                 return@setOnClickListener
             }
-            with(sp.edit()) {
-                val effectiveSplit = splitSwitch?.isChecked == true &&
-                    (dubSwitch?.isChecked == true || subSwitch?.isChecked == true)
-                putBoolean("isSplit", effectiveSplit)
-                putBoolean("dubEnabled", dubSwitch?.isChecked ?: false)
-                putBoolean("subEnabled", subSwitch?.isChecked ?: false)
-                putBoolean("logoEnabled", logoEnabledSwitch?.isChecked ?: true)
-                putBoolean("anilistEnricherEnabled", anilistSwitch?.isChecked ?: true)
-                logoLangSpinner?.let { spinner ->
-                    val selected = logoLanguages.getOrNull(spinner.selectedItemPosition) ?: "en"
-                    putString("logoLanguage", selected)
-                }
-                apply()
+            val editor = sp.edit()
+            val effectiveSplit = splitSwitch?.isChecked == true &&
+                (dubSwitch?.isChecked == true || subSwitch?.isChecked == true)
+            editor.putBoolean("isSplit", effectiveSplit)
+            editor.putBoolean("dubEnabled", dubSwitch?.isChecked ?: false)
+            editor.putBoolean("subEnabled", subSwitch?.isChecked ?: false)
+            editor.putBoolean("logoEnabled", logoEnabledSwitch?.isChecked ?: true)
+            editor.putBoolean("anilistEnricherEnabled", anilistSwitch?.isChecked ?: true)
+            logoLangSpinner?.let { spinner ->
+                val selected = logoLanguages.getOrNull(spinner.selectedItemPosition) ?: "en"
+                editor.putString("logoLanguage", selected)
             }
+            editor.apply()
 
             AlertDialog.Builder(requireContext())
                 .setTitle("Save & Reload")

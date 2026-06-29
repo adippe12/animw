@@ -22,7 +22,6 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.SyncIdName
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.VPNStatus
 import com.lagradost.cloudstream3.addDubStatus
@@ -87,11 +86,12 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     override val hasChromecastSupport = true
     override val vpnStatus = VPNStatus.None
 
-    // Declare which sync providers we can resolve URLs for (see getLoadUrl).
-    override val supportedSyncNames = setOf(
-        SyncIdName.MyAnimeList,
-        SyncIdName.AniList,
-    )
+    // NOTE: supportedSyncNames + getLoadUrl() are intentionally omitted.
+    // The SyncIdName enum was renamed/moved in newer cloudstream pre-release
+    // builds and the correct import path could not be resolved at build time.
+    // Sync providers (MAL/AniList) still work for *tracking* watches via the
+    // addMalId/addAniListId calls in load() — only the reverse direction
+    // (click-anime-in-MAL-list → open-in-AnimeWorld) is missing.
 
     open val currentExtension = CurrentExtension.CORE
 
@@ -319,44 +319,6 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     }
 
     /* ---------------------------------------------------------------- */
-    /*  Sync: translate external ID -> AnimeWorld URL                   */
-    /* ---------------------------------------------------------------- */
-
-    /**
-     * Called when the user clicks an anime in their MAL or AniList watch list.
-     * We resolve the external ID to an anime title, then search AnimeWorld
-     * by title and return the first match's URL.
-     */
-    override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
-        val title = when (name) {
-            SyncIdName.AniList -> {
-                // AniListEnricher.fetch already caches for 7 days — cheap.
-                AniListEnricher.fetch(id.toIntOrNull() ?: return null)
-                    ?.let { it.titleEnglish ?: it.titleRomaji ?: it.titleNative }
-            }
-            SyncIdName.MyAnimeList -> fetchMalTitle(id.toIntOrNull() ?: return null)
-            else -> null
-        } ?: return null
-
-        // Search AnimeWorld by the resolved title and return the first hit.
-        return search(title, page = 1).results
-            ?.firstOrNull()
-            ?.url
-    }
-
-    /** Use Jikan (public MAL API, no key) to resolve a MAL id to a title. */
-    private suspend fun fetchMalTitle(malId: Int): String? {
-        return try {
-            val response = app.get("https://api.jikan.moe/v4/anime/$malId").text
-            val titleMatch = Regex(""""title"\s*:\s*"([^"]+)"""").find(response)
-            titleMatch?.groupValues?.getOrNull(1)
-        } catch (e: Exception) {
-            Log.w(TAG, "MAL title lookup failed: ${e.message}")
-            null
-        }
-    }
-
-    /* ---------------------------------------------------------------- */
     /*  Load                                                            */
     /* ---------------------------------------------------------------- */
 
@@ -387,11 +349,14 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
 
         // If the page doesn't expose an AniList ID, try to resolve one by title
         // via APIHolder.getTracker — so obscure anime still get a logo + sync.
+        // NOTE: the `types` parameter expects Set<TrackerType>? — we pass null
+        // to avoid a dependency on the TrackerType enum which may differ across
+        // cloudstream versions.
         if (anlId == null) {
             try {
                 val tracker = APIHolder.getTracker(
                     titles = listOf(title, otherTitle).filter { it.isNotBlank() },
-                    types = listOf("TV", "MOVIE", "OVA"),
+                    types = null,
                     year = null,
                     lessAccurate = true
                 )
@@ -587,11 +552,17 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         if (apiResults.isEmpty()) return false
 
         // Forward any subtitle tracks returned by the episode-info API.
-        apiResults.forEach { info ->
-            info.subtitles?.forEach { sub ->
+        // NOTE: newSubtitleFile is suspend, so we can't call it inside a
+        // regular forEach. We collect the subtitle data first, then emit
+        // them in a suspend-safe way using amap (which provides a coroutine scope).
+        val subtitleList = apiResults.flatMap { info ->
+            info.subtitles.orEmpty().map { sub -> Triple(sub.label ?: "Italian", sub.url, sub.lang) }
+        }
+        if (subtitleList.isNotEmpty()) {
+            subtitleList.amap { (label, url, _) ->
                 try {
                     subtitleCallback(
-                        newSubtitleFile(sub.label ?: "Italian", sub.url) {
+                        newSubtitleFile(label, url) {
                             this.headers = mapOf("Referer" to mainUrl)
                         }
                     )
@@ -619,24 +590,13 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                 }
 
                 target.contains("listeamed.net") -> {
-                    // Delegate to the Vidguard extractor. We use the 4-arg
-                    // loadExtractor overload to rename the emitted links with
-                    // a language tag so the player source picker is clearer.
-                    loadExtractor(grabber, null, subtitleCallback) { link ->
-                        callback(
-                            newExtractorLink(
-                                source = link.source,
-                                name = "${link.name} [$langTag]",
-                                url = link.url,
-                                type = link.type,
-                            ) {
-                                this.referer = link.referer
-                                this.quality = link.quality
-                                this.headers = link.headers
-                                this.extractorData = link.extractorData
-                            }
-                        )
-                    }
+                    // Delegate to the Vidguard extractor.
+                    // NOTE: we can't rename the emitted links with a language
+                    // tag here because newExtractorLink is suspend and the
+                    // loadExtractor callback is (ExtractorLink) -> Unit (non-suspend).
+                    // The VidguardExtractor already names its links "VidGuard 1080p"
+                    // etc. via M3u8Helper, which is clear enough.
+                    loadExtractor(grabber, null, subtitleCallback, callback)
                 }
 
                 else -> Unit

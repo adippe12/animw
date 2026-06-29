@@ -152,7 +152,7 @@ object AniListEnricher {
                         "Content-Type" to "application/json",
                         "Accept" to "application/json",
                     ),
-                    requestBody = body,
+                    data = body,
                 )
                 if (!response.okhttpResponse.isSuccessful) {
                     Log.w(TAG, "AniList GraphQL non-OK status: ${response.okhttpResponse.code}")
@@ -231,8 +231,8 @@ object AniListEnricher {
             .trim()
     }
 
-    fun evict(anilistId: Int) = cache.remove(anilistId)
-    fun evictAll() = cache.clear()
+    fun evict(anilistId: Int) { cache.remove(anilistId) }
+    fun evictAll() { cache.clear() }
 }
 
 /* ---------- AniList GraphQL DTOs (only what we need) ---------- */

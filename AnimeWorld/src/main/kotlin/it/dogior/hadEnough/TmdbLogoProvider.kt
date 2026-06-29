@@ -183,6 +183,6 @@ object TmdbLogoProvider {
         return hashes.map { "$TMDB_IMAGE_CDN/$it.png" }
     }
 
-    fun evict(anilistId: Int) = cache.remove(anilistId)
-    fun evictAll() = cache.clear()
+    fun evict(anilistId: Int) { cache.remove(anilistId) }
+    fun evictAll() { cache.clear() }
 }
