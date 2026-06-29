@@ -102,7 +102,11 @@ object TmdbEpisodeProvider {
         val episodes = fetchSeasonEpisodes(tmdbId, season, language)
         Log.i(TAG, "TMDB $tmdbId season $season: parsed ${episodes.size} episodes")
 
-        val bySeasonEpisode = episodes.map { (it.season to it.episode) to it }.toMap()
+        // bySeasonEpisode: skip episodes with null season (shouldn't happen, but type-safe).
+        val bySeasonEpisode = episodes.mapNotNull { ep ->
+            val s = ep.season ?: return@mapNotNull null
+            (s to ep.episode) to ep
+        }.toMap()
         val byAirDate = episodes.mapNotNull { ep ->
             ep.airDate?.let { it to ep }
         }.toMap()
