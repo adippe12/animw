@@ -102,13 +102,6 @@
         android:paddingStart="4dp"
         android:paddingEnd="4dp" />
 
-    <Switch
-        android:id="@+id/anilist_enricher_switch"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:text="@string/anilist_enricher_switch_text"
-        android:textSize="17sp" />
-
     <View
         android:id="@+id/divider2"
         android:layout_width="match_parent"

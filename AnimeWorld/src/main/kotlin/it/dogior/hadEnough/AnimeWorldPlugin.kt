@@ -83,7 +83,4 @@ object PrefsHolder {
     // ---- Logo enrichment ----
     val logoEnabled: Boolean get() = prefs().getBoolean("logoEnabled", true)
     val logoLanguage: String get() = prefs().getString("logoLanguage", "it") ?: "it"
-
-    // ---- AniList enrichment ----
-    val anilistEnricherEnabled: Boolean get() = prefs().getBoolean("anilistEnricherEnabled", true)
 }

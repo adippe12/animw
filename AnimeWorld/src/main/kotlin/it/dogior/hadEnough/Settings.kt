@@ -144,19 +144,12 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
         )
         logoLangSpinner?.setSelection(currentLangIndex)
 
-        // ---- AniList enrichment ----
-        val anilistSwitch: Switch? = view.findViewByName("anilist_enricher_switch")
-        anilistSwitch?.text = getString("anilist_enricher_switch_text")
-        anilistSwitch?.isChecked = PrefsHolder.anilistEnricherEnabled
-
         // ---- Cache management ----
         val clearCacheBtn: Button? = view.findViewByName("clear_cache_btn")
         clearCacheBtn?.text = getString("clear_cache_btn_text")
         clearCacheBtn?.setOnClickListener {
             TmdbLogoProvider.evictAll()
-            TmdbEpisodeProvider.evictAll()
-            AniListEnricher.evictAll()
-            showToast("Cache logo + episodi + AniList pulita")
+            showToast("Cache logo pulita")
         }
 
         // ---- Save button ----
@@ -173,9 +166,8 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
             editor.putBoolean("dubEnabled", dubSwitch?.isChecked ?: false)
             editor.putBoolean("subEnabled", subSwitch?.isChecked ?: false)
             editor.putBoolean("logoEnabled", logoEnabledSwitch?.isChecked ?: true)
-            editor.putBoolean("anilistEnricherEnabled", anilistSwitch?.isChecked ?: true)
             logoLangSpinner?.let { spinner ->
-                val selected = logoLanguages.getOrNull(spinner.selectedItemPosition) ?: "en"
+                val selected = logoLanguages.getOrNull(spinner.selectedItemPosition) ?: "it"
                 editor.putString("logoLanguage", selected)
             }
             editor.apply()

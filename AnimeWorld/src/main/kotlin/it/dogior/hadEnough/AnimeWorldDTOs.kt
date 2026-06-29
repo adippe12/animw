@@ -6,9 +6,6 @@ import com.fasterxml.jackson.annotation.JsonProperty
 /**
  * All DTOs used by AnimeWorldCore + TmdbLogoProvider.
  *
- * NOTE: AniList GraphQL DTOs live in AniListEnricher.kt to avoid cluttering
- * this file (they're tightly coupled to the enricher's query shape).
- *
  * Best-practice: every DTO is annotated with @JsonIgnoreProperties(ignoreUnknown = true)
  * so a new field added upstream by AnimeWorld / ARM / TMDB will never break parsing.
  */

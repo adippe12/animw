@@ -2,7 +2,6 @@ package it.dogior.hadEnough
 
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.AnimeSearchResponse
-import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageList
@@ -43,8 +42,6 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.NiceResponse
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Element
@@ -54,24 +51,9 @@ import java.util.Locale
 /**
  * AnimeWorldCore — shared scraping logic for the Core / Sub / Dub variants.
  *
- * Improvements in this version:
- *  • **Parallel load()**: the TMDB logo fetch runs concurrently with page parsing
- *    via coroutineScope + async — halves load() latency.
- *  • **Cookie refresh on 403**: if the security cookie expires mid-session, the
- *    request() helper transparently refreshes it and retries.
- *  • **backgroundPosterUrl**: extracts the banner image for the detail page.
- *  • **synonyms**: alternative titles surface in search and on the detail page.
- *  • **getTracker fallback**: if the page lacks an AniList ID, we look it up by
- *    title via APIHolder.getTracker — so obscure anime still get a logo.
- *  • **Subtitles**: episode info API often returns subtitle tracks — we forward
- *    them to subtitleCallback.
- *  • **Episode enrichment**: per-episode name, posterUrl, description, date.
- *  • **loadExtractor with renaming**: extracted links get a [Sub ITA]/[Dub ITA]
- *    tag so the player source picker is clearer.
- *  • **Explicit capability flags**: hasDownloadSupport, hasChromecastSupport,
- *    vpnStatus, supportedSyncNames — all declared explicitly.
- *  • **getLoadUrl for sync**: user clicks an anime in their MAL/AniList list →
- *    CloudStream searches AnimeWorld by title and opens the right page.
+ * Enrichment: ONLY the title logo (AniList → ARM → TMDB → transparent PNG).
+ * Fast, single network round-trip, cached 24h. Everything else comes
+ * straight from the AnimeWorld HTML page.
  */
 open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     final override var mainUrl = Companion.mainUrl
@@ -374,44 +356,6 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         var malId = document.select("#mal-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
         var anlId = document.select("#anilist-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
 
-        // If the page doesn't expose an AniList ID, try to resolve one by title
-        // via APIHolder.getTracker — so obscure anime still get a logo + sync.
-        // NOTE: the `types` parameter expects Set<TrackerType>? — we pass null
-        // to avoid a dependency on the TrackerType enum which may differ across
-        // cloudstream versions.
-        if (anlId == null) {
-            try {
-                val tracker = APIHolder.getTracker(
-                    titles = listOf(title, otherTitle).filter { it.isNotBlank() },
-                    types = null,
-                    year = null,
-                    lessAccurate = true
-                )
-                // tracker.aniId / tracker.malId type varies across cloudstream
-                // versions (String? in some, Int? in others). Convert safely.
-                tracker?.aniId?.let { id ->
-                    when (id) {
-                        is Int -> id
-                        is String -> id.toIntOrNull()
-                        is Number -> id.toInt()
-                        else -> null
-                    }
-                }?.let { anlId = it }
-                if (malId == null) {
-                    tracker?.malId?.let { id ->
-                        when (id) {
-                            is Int -> id
-                            is String -> id.toIntOrNull()
-                            is Number -> id.toInt()
-                            else -> null
-                        }
-                    }?.let { malId = it }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "getTracker fallback failed: ${e.message}")
-            }
-        }
-
         var dub = false
         var year: Int? = null
         var status: ShowStatus? = null
@@ -486,227 +430,50 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         }.distinctBy { it.url }
 
         /* -------------------------------------------------------------- */
-        /*  Parallel enrichment: TMDB logo + AniList data + TMDB episodes */
+        /*  Title logo enrichment (AniList → ARM → TMDB → PNG)            */
         /* -------------------------------------------------------------- */
-        // Three network round-trips fire concurrently:
-        //   1. ARM + TMDB logo page → transparent PNG logo URL
-        //   2. AniList GraphQL → studio, cast, banner, score, airing schedule
-        //   3. TMDB season page → per-episode stills + titles + overviews
-        //
-        // Total latency = max(logo, anilist, tmdb_episodes) instead of sum.
-        //
+        // Single network round-trip (ARM + TMDB logo page), cached 24h.
         // User-configurable via Settings:
         //   - logoEnabled: master toggle for the TMDB logo lookup
         //   - logoLanguage: preferred language for the logo (default "it")
-        //   - anilistEnricherEnabled: master toggle for AniList enrichment
-        val (logoResult, anilistData, tmdbEpisodes) = coroutineScope {
-            val logoDeferred = async {
-                if (PrefsHolder.logoEnabled) {
-                    TmdbLogoProvider.fetchLogo(
-                        anilistId = anlId,
-                        // Priority: user preference (default "it") → en → ja → any
-                        language = PrefsHolder.logoLanguage,
-                        fallback = listOf("en", "ja", null),
-                    )
-                } else {
-                    TmdbLogoProvider.LogoResult(anilistId = anlId ?: -1)
-                }
-            }
-            val anilistDeferred = async {
-                if (PrefsHolder.anilistEnricherEnabled) AniListEnricher.fetch(anlId) else null
-            }
-            // Episode stills/titles from TMDB.
-            // Strategy: try ARM's season first; if 404 (season doesn't exist on
-            // TMDB, e.g. JJK S2 where ARM says season=2 but TMDB only has season 1),
-            // fall back to season 1.
-            val tmdbEpisodesDeferred = async {
-                if (PrefsHolder.anilistEnricherEnabled && episodes.isNotEmpty()) {
-                    val logoRes = TmdbLogoProvider.fetchLogo(anlId)
-                    val tmdbId = logoRes.tmdbId
-                    val armSeason = logoRes.tmdbSeason ?: 1
-                    if (tmdbId != null) {
-                        // Try ARM's season first.
-                        var seasonData = TmdbEpisodeProvider.fetchSeasonData(
-                            tmdbId = tmdbId,
-                            season = armSeason,
-                            language = PrefsHolder.logoLanguage,
-                        )
-                        // If ARM's season was empty (404), fall back to season 1.
-                        // This handles the JJK case: ARM says season=2, TMDB 404s,
-                        // but season 1 has all 59 episodes.
-                        if (seasonData.allEpisodes.isEmpty() && armSeason != 1) {
-                            Log.i(TAG, "ARM season $armSeason was empty/404, falling back to season 1")
-                            seasonData = TmdbEpisodeProvider.fetchSeasonData(
-                                tmdbId = tmdbId,
-                                season = 1,
-                                language = PrefsHolder.logoLanguage,
-                            )
-                        }
-                        seasonData
-                    } else {
-                        TmdbEpisodeProvider.SeasonData()
-                    }
-                } else {
-                    TmdbEpisodeProvider.SeasonData()
-                }
-            }
-            Triple(logoDeferred.await(), anilistDeferred.await(), tmdbEpisodesDeferred.await())
+        val logoResult = if (PrefsHolder.logoEnabled) {
+            TmdbLogoProvider.fetchLogo(
+                anilistId = anlId,
+                // Priority: user preference (default "it") → en → ja → any
+                language = PrefsHolder.logoLanguage,
+                fallback = listOf("en", "ja", null),
+            )
+        } else {
+            TmdbLogoProvider.LogoResult(anilistId = anlId ?: -1)
         }
-
-        // If AniList knows MAL id but the page didn't expose it, inherit it.
-        if (malId == null) anilistData?.malId?.let { malId = it }
-
-        /* -------------------------------------------------------------- */
-        /*  Episode enrichment — offset detection via air date matching   */
-        /* -------------------------------------------------------------- */
-        // Problem: TMDB may collapse multiple anime seasons into ONE TMDB season.
-        // Example: JJK S1+S2+S3 = TMDB season 1 with 59 episodes.
-        //
-        // Solution: "offset detection"
-        //   1. AniList gives us airingAt (Unix seconds) for each episode
-        //   2. TMDB gives us airDateUnix for each episode
-        //   3. Find the TMDB episode whose air date matches AniList ep 1
-        //   4. offset = that index; for AW ep N → TMDB allEpisodes[offset + N - 1]
-        //
-        // We compare Unix timestamps with a 2-day tolerance (TMDB dates are
-        // JP-local midnight, AniList are exact airing times in UTC).
-        val airingSchedule = anilistData?.airingSchedule ?: emptyMap()
-        val tmdbAllEps = tmdbEpisodes.allEpisodes
-
-        val offset = detectEpisodeOffset(airingSchedule, tmdbAllEps)
-        if (offset >= 0) {
-            val matchedEp = tmdbAllEps.getOrNull(offset)
-            Log.i(TAG, "Episode offset=$offset → TMDB S${matchedEp?.season}E${matchedEp?.episode}" +
-                " (title: ${matchedEp?.title})")
-        }
-
-        val enrichedEpisodes = episodes.map { ep ->
-            val epNum = ep.episode
-            val airingTs = epNum?.let { airingSchedule[it] }
-
-            // Use offset to index into the flat TMDB episode list.
-            val tmdbEp = if (offset >= 0 && epNum != null) {
-                tmdbAllEps.getOrNull(offset + epNum - 1)
-            } else null
-
-            newEpisode(ep.data) {
-                this.episode = ep.episode
-                this.name = ep.name
-                    ?: tmdbEp?.title
-                    ?: epNum?.let { "Episodio $it" }
-                this.posterUrl = ep.posterUrl ?: tmdbEp?.stillUrl
-                this.description = ep.description ?: tmdbEp?.overview
-                if (airingTs != null) {
-                    this.date = airingTs
-                }
-            }
-        }
-
-        // Synonyms: merge page-side otherTitle with AniList's synonyms list.
-        val allSynonyms = listOfNotNull(otherTitle.takeIf { it != title }) +
-            (anilistData?.synonyms ?: emptyList())
-        // Deduplicate while preserving order.
-        val synonyms = allSynonyms.distinct().filter { it != title }
-
-        // Tags: merge AnimeWorld genres with AniList tags (AniList has ~2000).
-        val allTags = (genres + (anilistData?.tags?.map { it.name } ?: emptyList()))
-            .distinct()
-
-        // Score: prefer AniList average score (0-100), fall back to AnimeWorld.
-        val effectiveScore = anilistData?.score?.let { Score.from100(it.toInt()) }
-            ?: rating.toDoubleOrNull()?.let { Score.from10(it) }
-
-        // Background banner: prefer AniList's high-res banner, fall back to page.
-        val effectiveBackground = anilistData?.bannerImage ?: backgroundPoster
-
-        // Trailer: prefer AniList's YouTube id, fall back to page.
-        val effectiveTrailer = anilistData?.trailerYoutubeId?.let { "https://www.youtube.com/watch?v=$it" }
-            ?: trailerUrl
-
-        // Plot: prefer AniList description (usually more detailed), fall back to page.
-        val effectivePlot = anilistData?.description ?: description
-
-        // Status: prefer AniList (more reliable than AnimeWorld's "In corso").
-        val effectiveStatus = anilistData?.status?.let {
-            when (it) {
-                "FINISHED" -> ShowStatus.Completed
-                "RELEASING" -> ShowStatus.Ongoing
-                else -> status
-            }
-        } ?: status
 
         return newAnimeLoadResponse(title, actualUrl, type) {
             engName = title
-            japName = anilistData?.titleNative ?: otherTitle
-            this.synonyms = synonyms
+            japName = otherTitle
+            this.synonyms = listOfNotNull(otherTitle.takeIf { it != title })
             addPoster(poster)
-            this.backgroundPosterUrl = effectiveBackground
-            this.year = year ?: anilistData?.seasonYear
-            addEpisodes(if (dub) DubStatus.Dubbed else DubStatus.Subbed, enrichedEpisodes)
-            showStatus = effectiveStatus
-            plot = effectivePlot
-            tags = allTags
+            this.backgroundPosterUrl = backgroundPoster
+            this.year = year
+            addEpisodes(if (dub) DubStatus.Dubbed else DubStatus.Subbed, episodes)
+            showStatus = status
+            plot = description
+            tags = genres
             addMalId(malId)
             addAniListId(anlId)
             logoResult.tmdbId?.let { addTMDbId(it.toString()) }
-            score = effectiveScore
+            rating.toDoubleOrNull()?.let { score = Score.from10(it) }
             duration?.let { addDuration(it) }
-                ?: anilistData?.duration?.let { addDuration("${it} min") }
-            addTrailer(effectiveTrailer)
+            addTrailer(trailerUrl)
+            // *** THE LOGO ***
+            // logoUrl is rendered by CloudStream as a transparent title image
+            // overlay on the detail page.
             logoResult.logoUrl?.let { this.logoUrl = it }
             this.recommendations = recommendations
             this.comingSoon = comingSoon
-            // Voice actors + studio from AniList — renders as a cast list.
-            anilistData?.voiceActors?.let { actors = it }
-            if (enrichedEpisodes.isNotEmpty() && nextAiringUnix != null && enrichedEpisodes.last().episode != null) {
-                this.nextAiring = NextAiring(enrichedEpisodes.last().episode!! + 1, nextAiringUnix, null)
+            if (episodes.isNotEmpty() && nextAiringUnix != null && episodes.last().episode != null) {
+                this.nextAiring = NextAiring(episodes.last().episode!! + 1, nextAiringUnix, null)
             }
         }
-    }
-
-    /**
-     * Detect the offset between AnimeWorld/AniList episode numbers and TMDB's
-     * flat episode list.
-     *
-     * Example: JJK S2 on AnimeWorld has eps 1-23. TMDB has ONE season with
-     * 59 episodes (S1=1-24, S2=25-47, S3=48-59). AniList says JJK S2 ep 1
-     * aired on 2023-07-06. We scan TMDB's episode list for an episode airing
-     * around that date → index 24 (TMDB ep 25). So offset=24, and
-     * AW ep N → TMDB index 24+N-1.
-     *
-     * Uses Unix timestamp comparison with a 2-day tolerance (TMDB dates are
-     * JP-local midnight, AniList are exact airing times in UTC — there can
-     * be a few hours of difference).
-     *
-     * @return the TMDB allEpisodes index matching AniList ep 1, or -1 if no match
-     */
-    private fun detectEpisodeOffset(
-        airingSchedule: Map<Int, Long>,
-        tmdbEpisodes: List<TmdbEpisodeProvider.EpisodeData>,
-    ): Int {
-        if (airingSchedule.isEmpty() || tmdbEpisodes.isEmpty()) return -1
-
-        val toleranceSeconds = 2L * 24 * 60 * 60  // 2 days
-
-        // Try matching ep 1, then ep 2, ..., up to ep 5 — in case ep 1's date is missing.
-        for (anilistEp in 1..5) {
-            val airingTs = airingSchedule[anilistEp] ?: continue
-
-            // Find the first TMDB episode whose air date is within tolerance.
-            val matchIndex = tmdbEpisodes.indexOfFirst { ep ->
-                val tmdbTs = ep.airDateUnix ?: return@indexOfFirst false
-                kotlin.math.abs(tmdbTs - airingTs) <= toleranceSeconds
-            }
-            if (matchIndex >= 0) {
-                // matchIndex corresponds to AniList ep `anilistEp`.
-                // For AniList ep 1, offset = matchIndex - (anilistEp - 1).
-                return matchIndex - anilistEp + 1
-            }
-        }
-
-        // Fallback: if no date match, assume AW ep 1 = TMDB ep 1.
-        // This works for single-season anime where TMDB ep N = AW ep N.
-        return 0
     }
 
     private fun normalizeDuration(input: String?): String? {

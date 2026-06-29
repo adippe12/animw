@@ -193,4 +193,11 @@ object TmdbLogoProvider {
 
     fun evict(anilistId: Int) { cache.remove(anilistId) }
     fun evictAll() { cache.clear() }
+
+    /**
+     * Fetch ARM mappings for an AniList id — exposed in case other providers
+     * need the MAL/TMDB id. Results are NOT cached here (the logo fetch
+     * caches its own result).
+     */
+    suspend fun fetchArmMappings(anilistId: Int): ArmMappings? = anilistToMappings(anilistId)
 }
