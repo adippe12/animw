@@ -12,7 +12,10 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+        // IMPORTANT: don't bump past 2.0.20 — newer Kotlin versions break
+        // the cloudstream gradle plugin's DSL resolution inside the
+        // dependencies { cloudstream("...") } block.
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.20")
     }
 }
 
@@ -24,22 +27,24 @@ allprojects {
     }
 }
 
-fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
-    extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
-
-fun Project.android(configuration: BaseExtension.() -> Unit) =
-    extensions.getByName<BaseExtension>("android").configuration()
-
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
-    cloudstream {
+    // NOTE: do NOT define a top-level `fun Project.cloudstream(...)` helper here.
+    // It clashes with the `cloudstream` dependency configuration that the
+    // cloudstream gradle plugin registers, and Kotlin resolves
+    // `dependencies { cloudstream("...") }` to the helper instead of the
+    // configuration — causing "Type mismatch: inferred type is String but
+    // CloudstreamExtension.() -> Unit was expected".
+    //
+    // Use the verbose `extensions.configure<>()` form instead.
+    extensions.configure<CloudstreamExtension>("cloudstream") {
         setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/doGior/doGiorsHadEnough")
     }
 
-    android {
+    extensions.configure<BaseExtension>("android") {
         namespace = "com.lagradost.cloudstream3.${project.name.lowercase().replace("-", "_")}"
         defaultConfig {
             minSdk = 21
@@ -63,7 +68,6 @@ subprojects {
     }
 
     dependencies {
-        // Single cloudstream dependency (multiple deps is a build error).
         cloudstream("com.lagradost:cloudstream3:pre-release")
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
