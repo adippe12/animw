@@ -45,6 +45,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.NiceResponse
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
@@ -78,7 +79,10 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     override var lang = "it"
     override val hasMainPage = true
     override val hasQuickSearch = true
-    override var sequentialMainPage = true
+    // sequentialMainPage = false → all home-page sections load CONCURRENTLY
+    // instead of one-at-a-time. With 4 sections this cuts total load time
+    // from ~4×HTTP_latency to ~1×HTTP_latency.
+    override var sequentialMainPage = false
 
     // Explicit capability declarations — defaults are fine but making them
     // explicit documents intent and protects against future engine changes.
@@ -121,15 +125,26 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         private var cookies = mutableMapOf<String, String>()
         private var headers = mutableMapOf<String, String>()
 
+        // Mutex ensures the security cookie is bootstrapped exactly once even
+        // when multiple home-page sections fetch concurrently.
+        private val cookieMutex = kotlinx.coroutines.sync.Mutex()
+        @Volatile private var cookieInitialized = false
+
         /**
          * GET helper that injects the AnimeWorld security cookie on first call.
+         * Thread-safe: concurrent callers wait on cookieMutex while the first
+         * caller bootstraps the cookie.
          * If a request returns 403, the cookie is refreshed and the request
-         * retried exactly once — prevents cascading failures when the cookie
-         * expires mid-browse.
+         * retried exactly once.
          */
         private suspend fun request(url: String): NiceResponse {
-            if (!headers.containsKey("Cookie")) {
-                getSecurityCookie()?.let { headers["Cookie"] = it }
+            if (!cookieInitialized) {
+                cookieMutex.withLock {
+                    if (!cookieInitialized) {
+                        getSecurityCookie()?.let { headers["Cookie"] = it }
+                        cookieInitialized = true
+                    }
+                }
             }
             val response = app.get(url, headers = headers)
             if (response.okhttpResponse.code == 403) {
@@ -139,6 +154,18 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                 return app.get(url, headers = headers)
             }
             return response
+        }
+
+        /** Pre-warm the security cookie. Call from Plugin.load() for faster first homepage. */
+        suspend fun prewarmCookie() {
+            if (!cookieInitialized) {
+                cookieMutex.withLock {
+                    if (!cookieInitialized) {
+                        getSecurityCookie()?.let { headers["Cookie"] = it }
+                        cookieInitialized = true
+                    }
+                }
+            }
         }
 
         private suspend fun getSecurityCookie(): String? {
@@ -409,15 +436,37 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         // distinctBy episode number (§8.14 of the CloudStream guide) protects
         // against duplicate episode entries that occasionally appear when
         // AnimeWorld is in the middle of a server migration.
+        //
+        // Episode metadata extraction:
+        //   - number: from data-episode-num attribute
+        //   - name: from data-episode-name attr, or <a> text if it's more than
+        //     just the number, or fallback "Episodio N"
+        //   - poster: from img src if present, otherwise falls back to the
+        //     anime's main poster (set at LoadResponse level)
+        //   - description: from data-episode-description if present
         val servers = document.select(".widget.servers > .widget-body")
         val episodes = servers.select(".server[data-name=\"9\"] .episode").map { epElem ->
-            val number = epElem.select("a").attr("data-episode-num").toIntOrNull()
-            val epName = epElem.select("a").attr("data-episode-name").takeIf { it.isNotBlank() }
-            val epPoster = epElem.select("img").attr("src").takeIf { it.isNotBlank() }
+            val anchor = epElem.select("a")
+            val number = anchor.attr("data-episode-num").toIntOrNull()
+            // Try multiple sources for the episode name.
+            val epName = anchor.attr("data-episode-name")
+                .takeIf { it.isNotBlank() }
+                ?: anchor.attr("title")
+                    .takeIf { it.isNotBlank() }
+                ?: anchor.select(".name, .episode-name").firstOrNull()?.text()
+                    ?.takeIf { it.isNotBlank() && it != number?.toString() }
+                ?: "Episodio $number".takeIf { number != null }
+            val epPoster = epElem.select("img").attr("src")
+                .takeIf { it.isNotBlank() }
+                ?: epElem.select(".thumb img").attr("src")
+                    .takeIf { it.isNotBlank() }
+            val epDesc = anchor.attr("data-episode-description")
+                .takeIf { it.isNotBlank() }
             newEpisode("$number¿$actualUrl") {
                 this.episode = number
                 this.name = epName
                 this.posterUrl = epPoster
+                this.description = epDesc
             }
         }.distinctBy { it.episode }
         val comingSoon = episodes.isEmpty()
@@ -437,23 +486,27 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         }.distinctBy { it.url }
 
         /* -------------------------------------------------------------- */
-        /*  Parallel enrichment: TMDB logo + AniList data                 */
+        /*  Parallel enrichment: TMDB logo + AniList data + TMDB episodes */
         /* -------------------------------------------------------------- */
-        // Both network round-trips (ARM+TMDB for logo, AniList GraphQL for
-        // enrichment) fire concurrently via coroutineScope + async. Total
-        // latency = max(logo, anilist) instead of sum(logo, anilist).
+        // Three network round-trips fire concurrently:
+        //   1. ARM + TMDB logo page → transparent PNG logo URL
+        //   2. AniList GraphQL → studio, cast, banner, score, airing schedule
+        //   3. TMDB season page → per-episode stills + titles + overviews
+        //
+        // Total latency = max(logo, anilist, tmdb_episodes) instead of sum.
         //
         // User-configurable via Settings:
         //   - logoEnabled: master toggle for the TMDB logo lookup
-        //   - logoLanguage: preferred language for the logo (default "en")
+        //   - logoLanguage: preferred language for the logo (default "it")
         //   - anilistEnricherEnabled: master toggle for AniList enrichment
-        val (logoResult, anilistData) = coroutineScope {
+        val (logoResult, anilistData, tmdbEpisodes) = coroutineScope {
             val logoDeferred = async {
                 if (PrefsHolder.logoEnabled) {
                     TmdbLogoProvider.fetchLogo(
                         anilistId = anlId,
+                        // Priority: user preference (default "it") → en → ja → any
                         language = PrefsHolder.logoLanguage,
-                        fallback = listOf("ja", null),
+                        fallback = listOf("en", "ja", null),
                     )
                 } else {
                     TmdbLogoProvider.LogoResult(anilistId = anlId ?: -1)
@@ -462,11 +515,77 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
             val anilistDeferred = async {
                 if (PrefsHolder.anilistEnricherEnabled) AniListEnricher.fetch(anlId) else null
             }
-            logoDeferred.await() to anilistDeferred.await()
+            // Episode stills/titles from TMDB — fetch ALL seasons (not just S1)
+            // because anime franchises are often split: AW has "JJK" + "JJK 2"
+            // as separate pages, AniList has separate IDs, but TMDB has ONE show
+            // with multiple seasons. We match by air date later.
+            val tmdbEpisodesDeferred = async {
+                if (PrefsHolder.anilistEnricherEnabled && episodes.isNotEmpty()) {
+                    val tmdbId = TmdbLogoProvider.fetchLogo(anlId).tmdbId
+                    if (tmdbId != null) {
+                        TmdbEpisodeProvider.fetchShowData(
+                            tmdbId = tmdbId,
+                            language = PrefsHolder.logoLanguage,
+                        )
+                    } else {
+                        TmdbEpisodeProvider.SeasonData()
+                    }
+                } else {
+                    TmdbEpisodeProvider.SeasonData()
+                }
+            }
+            Triple(logoDeferred.await(), anilistDeferred.await(), tmdbEpisodesDeferred.await())
         }
 
         // If AniList knows MAL id but the page didn't expose it, inherit it.
         if (malId == null) anilistData?.malId?.let { malId = it }
+
+        /* -------------------------------------------------------------- */
+        /*  Episode enrichment — match by air date across all TMDB seasons */
+        /* -------------------------------------------------------------- */
+        // Problem: AnimeWorld may have "JJK" + "JJK 2" as separate pages,
+        // each with its own AniList ID. ARM maps both to the SAME TMDB show
+        // (which has season 1 + season 2). We can't ask ARM "which season?".
+        //
+        // Solution: AniList gives us the airing timestamp of each episode.
+        // TMDB gives us the air date of each episode per season. We match
+        // episodes whose air dates align (same calendar day).
+        //
+        // Fallback: if no air date match, try (season=1, episode=N) — the
+        // common case for single-season anime.
+        val airingSchedule = anilistData?.airingSchedule ?: emptyMap()
+        val enrichedEpisodes = episodes.map { ep ->
+            val epNum = ep.episode
+
+            // Step 1: try to match by air date.
+            // AniList airingAt is Unix seconds; TMDB air_date is "YYYY-MM-DD".
+            val airingTs = epNum?.let { airingSchedule[it] }
+            val tmdbEpByDate = airingTs?.let { ts ->
+                val dateStr = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                    .format(java.util.Date(ts * 1000))
+                tmdbEpisodes.byAirDate[dateStr]
+            }
+
+            // Step 2: fallback to season 1 + episode number (common case).
+            val tmdbEp = tmdbEpByDate
+                ?: epNum?.let { tmdbEpisodes.bySeasonEpisode[1 to it] }
+
+            newEpisode(ep.data) {
+                this.episode = ep.episode
+                // Name: prefer AnimeWorld's, fall back to TMDB, then "Episodio N"
+                this.name = ep.name
+                    ?: tmdbEp?.title
+                    ?: epNum?.let { "Episodio $it" }
+                // Poster: prefer AnimeWorld's, fall back to TMDB still
+                this.posterUrl = ep.posterUrl ?: tmdbEp?.stillUrl
+                // Description: prefer AnimeWorld's, fall back to TMDB overview
+                this.description = ep.description ?: tmdbEp?.overview
+                // Air date from AniList airing schedule
+                if (airingTs != null) {
+                    this.date = airingTs
+                }
+            }
+        }
 
         // Synonyms: merge page-side otherTitle with AniList's synonyms list.
         val allSynonyms = listOfNotNull(otherTitle.takeIf { it != title }) +
@@ -508,7 +627,7 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
             addPoster(poster)
             this.backgroundPosterUrl = effectiveBackground
             this.year = year ?: anilistData?.seasonYear
-            addEpisodes(if (dub) DubStatus.Dubbed else DubStatus.Subbed, episodes)
+            addEpisodes(if (dub) DubStatus.Dubbed else DubStatus.Subbed, enrichedEpisodes)
             showStatus = effectiveStatus
             plot = effectivePlot
             tags = allTags
@@ -524,8 +643,8 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
             this.comingSoon = comingSoon
             // Voice actors + studio from AniList — renders as a cast list.
             anilistData?.voiceActors?.let { actors = it }
-            if (episodes.isNotEmpty() && nextAiringUnix != null && episodes.last().episode != null) {
-                this.nextAiring = NextAiring(episodes.last().episode!! + 1, nextAiringUnix, null)
+            if (enrichedEpisodes.isNotEmpty() && nextAiringUnix != null && enrichedEpisodes.last().episode != null) {
+                this.nextAiring = NextAiring(enrichedEpisodes.last().episode!! + 1, nextAiringUnix, null)
             }
         }
     }

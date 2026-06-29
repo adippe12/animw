@@ -6,6 +6,9 @@ import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CommonActivity.activity
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * AnimeWorldPlugin — the .cs3 entry point.
@@ -21,6 +24,12 @@ class AnimeWorldPlugin : Plugin() {
         // Initialise the shared preferences holder BEFORE registering providers
         // — the providers read it lazily on every request.
         PrefsHolder.init(context)
+
+        // Pre-warm the AnimeWorld security cookie in background so the first
+        // homepage load doesn't pay the cookie-bootstrap latency (~500ms).
+        CoroutineScope(Dispatchers.IO).launch {
+            try { AnimeWorldCore.prewarmCookie() } catch (_: Exception) {}
+        }
 
         val isSplit = PrefsHolder.isSplit
         val dubEnabled = PrefsHolder.dubEnabled
@@ -73,7 +82,7 @@ object PrefsHolder {
 
     // ---- Logo enrichment ----
     val logoEnabled: Boolean get() = prefs().getBoolean("logoEnabled", true)
-    val logoLanguage: String get() = prefs().getString("logoLanguage", "en") ?: "en"
+    val logoLanguage: String get() = prefs().getString("logoLanguage", "it") ?: "it"
 
     // ---- AniList enrichment ----
     val anilistEnricherEnabled: Boolean get() = prefs().getBoolean("anilistEnricherEnabled", true)

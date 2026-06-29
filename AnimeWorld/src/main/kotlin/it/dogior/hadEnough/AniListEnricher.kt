@@ -75,6 +75,8 @@ object AniListEnricher {
         val tags: List<AniListTag> = emptyList(),
         val voiceActors: List<ActorData> = emptyList(),
         val description: String? = null,
+        /** Episode number -> Unix timestamp (seconds) of airing. Used for Episode.addDate(). */
+        val airingSchedule: Map<Int, Long> = emptyMap(),
     )
 
     data class AniListTag(val name: String, val rank: Int? = null)
@@ -115,6 +117,9 @@ object AniListEnricher {
               }
             }
             description
+            airingSchedule(perPage: 200) {
+              nodes { episode airingAt }
+            }
           }
         }
     """.trimIndent()
@@ -206,6 +211,13 @@ object AniListEnricher {
             tags = media.tags.orEmpty().map { AniListTag(it.name, it.rank) },
             voiceActors = voiceActors,
             description = media.description?.let(::stripHtml),
+            airingSchedule = media.airingSchedule?.nodes.orEmpty()
+                .mapNotNull { node ->
+                    val ep = node.episode ?: return@mapNotNull null
+                    val ts = node.airingAt ?: return@mapNotNull null
+                    ep to ts.toLong()
+                }
+                .toMap(),
         )
     }
 
@@ -266,6 +278,7 @@ data class AniListMedia(
     @JsonProperty("tags") val tags: List<AniListTagNode>? = null,
     @JsonProperty("characters") val characters: AniListCharacterConn? = null,
     @JsonProperty("description") val description: String? = null,
+    @JsonProperty("airingSchedule") val airingSchedule: AniListAiringConn? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -330,4 +343,15 @@ data class AniListCharacterImage(
 data class AniListVoiceActor(
     @JsonProperty("name") val name: AniListCharacterName? = null,
     @JsonProperty("image") val image: AniListCharacterImage? = null,
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class AniListAiringConn(
+    @JsonProperty("nodes") val nodes: List<AniListAiringNode>? = null,
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class AniListAiringNode(
+    @JsonProperty("episode") val episode: Int? = null,
+    @JsonProperty("airingAt") val airingAt: Int? = null,  // Unix timestamp (seconds)
 )

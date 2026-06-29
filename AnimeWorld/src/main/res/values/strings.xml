@@ -10,8 +10,8 @@
     <!-- Logo enrichment -->
     <string name="logo_enabled_switch_text">Logo PNG trasparente (TMDB)</string>
     <string name="logo_lang_label">Lingua preferita per il logo</string>
-    <string name="anilist_enricher_switch_text">Arricchimento AniList (cast, studio, banner)</string>
+    <string name="anilist_enricher_switch_text">Arricchimento AniList + TMDB (cast, studio, banner, episodi)</string>
 
     <!-- Cache management -->
-    <string name="clear_cache_btn_text">Pulisci cache logo + AniList</string>
+    <string name="clear_cache_btn_text">Pulisci cache (logo + episodi + AniList)</string>
 </resources>

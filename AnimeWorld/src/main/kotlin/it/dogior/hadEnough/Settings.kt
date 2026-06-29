@@ -37,11 +37,11 @@ import com.lagradost.cloudstream3.CommonActivity.showToast
 class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment() {
 
     /** Logo language options exposed in the UI. */
-    private val logoLanguages = listOf("en", "ja", "it", "fr", "de", "es", "pt", "ko", "zh")
+    private val logoLanguages = listOf("it", "en", "ja", "fr", "de", "es", "pt", "ko", "zh")
     private val logoLanguageLabels = listOf(
+        "Italiano (it)",
         "Inglese (en)",
         "Giapponese (ja)",
-        "Italiano (it)",
         "Francese (fr)",
         "Tedesco (de)",
         "Spagnolo (es)",
@@ -154,8 +154,9 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
         clearCacheBtn?.text = getString("clear_cache_btn_text")
         clearCacheBtn?.setOnClickListener {
             TmdbLogoProvider.evictAll()
+            TmdbEpisodeProvider.evictAll()
             AniListEnricher.evictAll()
-            showToast("Cache logo + AniList pulita")
+            showToast("Cache logo + episodi + AniList pulita")
         }
 
         // ---- Save button ----
