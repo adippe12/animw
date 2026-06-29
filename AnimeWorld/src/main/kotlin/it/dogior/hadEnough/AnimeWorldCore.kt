@@ -380,26 +380,27 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         // distinctBy episode number (§8.14 of the CloudStream guide) protects
         // against duplicate episode entries that occasionally appear when
         // AnimeWorld is in the middle of a server migration.
-        //
-        // Episode metadata extraction:
-        //   - number: from data-episode-num attribute
-        //   - name: from data-episode-name attr, or <a> text if it's more than
-        //     just the number, or fallback "Episodio N"
-        //   - poster: from img src if present, otherwise falls back to the
-        //     anime's main poster (set at LoadResponse level)
-        //   - description: from data-episode-description if present
         val servers = document.select(".widget.servers > .widget-body")
         val episodes = servers.select(".server[data-name=\"9\"] .episode").map { epElem ->
             val anchor = epElem.select("a")
             val number = anchor.attr("data-episode-num").toIntOrNull()
-            // Try multiple sources for the episode name.
-            val epName = anchor.attr("data-episode-name")
+            
+            // Try parsing the name from various elements
+            val rawName = anchor.attr("data-episode-name")
                 .takeIf { it.isNotBlank() }
                 ?: anchor.attr("title")
                     .takeIf { it.isNotBlank() }
                 ?: anchor.select(".name, .episode-name").firstOrNull()?.text()
-                    ?.takeIf { it.isNotBlank() && it != number?.toString() }
-                ?: "Episodio $number".takeIf { number != null }
+
+            // If the parsed string is merely "Episodio X" or the index number,
+            // we leave epName as null. This lets CloudStream automatically fetch
+            // the actual episode title from TMDB, AniList, or MAL.
+            val epName = rawName?.takeIf { name ->
+                name.isNotBlank() && 
+                !name.equals(number?.toString(), ignoreCase = true) &&
+                !name.startsWith("Episodio", ignoreCase = true)
+            }
+
             val epPoster = epElem.select("img").attr("src")
                 .takeIf { it.isNotBlank() }
                 ?: epElem.select(".thumb img").attr("src")
