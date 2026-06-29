@@ -134,7 +134,7 @@ In CloudStream 3: **Settings → Extensions → Repositories → Add repository*
 then paste:
 
 ```
-https://raw.githubusercontent.com/adippe12/animw/main/repo.json
+https://raw.githubusercontent.com/doGior/doGiorsHadEnough/main/repo.json
 ```
 
 The first CI build populates the `builds` branch with `plugins.json` and every `.cs3` artifact.

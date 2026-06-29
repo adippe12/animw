@@ -1,5 +1,7 @@
 *.cs3
 *.jar
+# Gradle wrapper jar MUST be committed — it's required to bootstrap the build.
+!gradle/wrapper/gradle-wrapper.jar
 build/
 .idea/
 .gradle/

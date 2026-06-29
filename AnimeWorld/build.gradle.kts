@@ -3,7 +3,7 @@ version = 21
 
 cloudstream {
     language = "it"
-    authors = listOf("doGior", "DieGon", "adippe12")
+    authors = listOf("doGior", "DieGon")
     requiresResources = true
     description = "Anime da AnimeWorld con logo PNG trasparente (AniList → ARM → TMDB)."
 
