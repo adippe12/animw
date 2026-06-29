@@ -10,8 +10,6 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -136,23 +134,19 @@ object AniListEnricher {
 
         val data = withContext(Dispatchers.IO) {
             try {
-                // Build the GraphQL POST body manually — avoids needing a JSON
-                // serializer for the request side (we only deserialize the
-                // response via Jackson).
-                val escapedQuery = QUERY
-                    .replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", "\\n")
-                val body = """{"query":"$escapedQuery","variables":{"id":$anilistId}}"""
-                    .toRequestBody("application/json".toMediaType())
-
+                // AniList GraphQL accepts form-encoded POST with `query` and
+                // `variables` fields — avoids needing a RequestBody, which
+                // NiceHttp's `data` parameter doesn't accept.
                 val response = app.post(
                     ANILIST_GRAPHQL,
                     headers = mapOf(
-                        "Content-Type" to "application/json",
+                        "Content-Type" to "application/x-www-form-urlencoded",
                         "Accept" to "application/json",
                     ),
-                    data = body,
+                    data = mapOf(
+                        "query" to QUERY,
+                        "variables" to """{"id":$anilistId}""",
+                    ),
                 )
                 if (!response.okhttpResponse.isSuccessful) {
                     Log.w(TAG, "AniList GraphQL non-OK status: ${response.okhttpResponse.code}")

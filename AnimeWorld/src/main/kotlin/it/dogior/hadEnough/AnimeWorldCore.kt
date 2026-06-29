@@ -360,8 +360,26 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                     year = null,
                     lessAccurate = true
                 )
-                tracker?.aniId?.toIntOrNull()?.let { anlId = it }
-                if (malId == null) tracker?.malId?.toIntOrNull()?.let { malId = it }
+                // tracker.aniId / tracker.malId type varies across cloudstream
+                // versions (String? in some, Int? in others). Convert safely.
+                tracker?.aniId?.let { id ->
+                    when (id) {
+                        is Int -> id
+                        is String -> id.toIntOrNull()
+                        is Number -> id.toInt()
+                        else -> null
+                    }
+                }?.let { anlId = it }
+                if (malId == null) {
+                    tracker?.malId?.let { id ->
+                        when (id) {
+                            is Int -> id
+                            is String -> id.toIntOrNull()
+                            is Number -> id.toInt()
+                            else -> null
+                        }
+                    }?.let { malId = it }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "getTracker fallback failed: ${e.message}")
             }
