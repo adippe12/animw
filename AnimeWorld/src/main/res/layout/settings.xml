@@ -40,6 +40,7 @@
         android:layout_height="16dp"
         android:background="@android:color/transparent" />
 
+    <!-- ============ Provider split ============ -->
     <Switch
         android:id="@+id/unique_switch"
         android:layout_width="match_parent"
@@ -70,9 +71,61 @@
     </LinearLayout>
 
     <View
+        android:id="@+id/divider_mid"
+        android:layout_width="match_parent"
+        android:layout_height="12dp"
+        android:background="@android:color/transparent" />
+
+    <!-- ============ Logo enrichment ============ -->
+    <Switch
+        android:id="@+id/logo_enabled_switch"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:text="@string/logo_enabled_switch_text"
+        android:textSize="17sp" />
+
+    <TextView
+        android:id="@+id/logo_lang_label"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="4dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="4dp"
+        android:text="@string/logo_lang_label"
+        android:textSize="14sp"
+        android:textStyle="bold" />
+
+    <Spinner
+        android:id="@+id/logo_lang_spinner"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp" />
+
+    <Switch
+        android:id="@+id/anilist_enricher_switch"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:text="@string/anilist_enricher_switch_text"
+        android:textSize="17sp" />
+
+    <View
         android:id="@+id/divider2"
         android:layout_width="match_parent"
         android:layout_height="16dp"
+        android:background="@android:color/transparent" />
+
+    <!-- ============ Cache management ============ -->
+    <Button
+        android:id="@+id/clear_cache_btn"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:text="@string/clear_cache_btn_text" />
+
+    <View
+        android:id="@+id/divider3"
+        android:layout_width="match_parent"
+        android:layout_height="8dp"
         android:background="@android:color/transparent" />
 
 </LinearLayout>

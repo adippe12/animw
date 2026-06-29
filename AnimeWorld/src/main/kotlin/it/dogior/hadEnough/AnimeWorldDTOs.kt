@@ -6,6 +6,9 @@ import com.fasterxml.jackson.annotation.JsonProperty
 /**
  * All DTOs used by AnimeWorldCore + TmdbLogoProvider.
  *
+ * NOTE: AniList GraphQL DTOs live in AniListEnricher.kt to avoid cluttering
+ * this file (they're tightly coupled to the enricher's query shape).
+ *
  * Best-practice: every DTO is annotated with @JsonIgnoreProperties(ignoreUnknown = true)
  * so a new field added upstream by AnimeWorld / ARM / TMDB will never break parsing.
  */
@@ -35,6 +38,15 @@ data class EpisodeInfoJson(
     @JsonProperty("grabber") val grabber: String,
     @JsonProperty("name") val name: String? = null,
     @JsonProperty("target") val target: String? = null,
+    /** Some AnimeWorld servers return subtitle tracks alongside the video URL. */
+    @JsonProperty("subtitles") val subtitles: List<SubtitleJson>? = null,
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class SubtitleJson(
+    @JsonProperty("url") val url: String,
+    @JsonProperty("lang") val lang: String? = null,
+    @JsonProperty("label") val label: String? = null,
 )
 
 /* ---------- ARM (Anime Repository Mapping) API ---------- */

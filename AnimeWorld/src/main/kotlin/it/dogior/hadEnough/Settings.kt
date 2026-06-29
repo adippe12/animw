@@ -2,14 +2,18 @@ package it.dogior.hadEnough
 
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import androidx.annotation.RequiresApi
@@ -21,21 +25,36 @@ import com.lagradost.cloudstream3.CommonActivity.showToast
 /**
  * Settings bottom-sheet.
  *
- * Two preferences:
- *   - "Divisione plugin" (isSplit): when ON, the plugin registers two
- *     separate providers (AnimeWorld Dub / AnimeWorld Sub) instead of one
- *     unified AnimeWorld Core.
- *   - When isSplit is ON, two sub-switches appear: "AnimeWorld Dub" and
- *     "AnimeWorld Sub" — each controls whether the corresponding provider
- *     is registered.
+ * Four preference groups:
+ *   1. Provider split (isSplit + dub/sub toggles)
+ *   2. Logo enrichment (enabled toggle + language preference)
+ *   3. AniList enrichment (cast, studio, banner, score, etc.)
+ *   4. Cache management (clear logo + AniList cache)
  *
- * Toggling any preference requires a restart — we prompt the user with an
- * AlertDialog and, on confirmation, restart the host process.
+ * The preferences are read by the provider at request time via
+ * `settingsForProvider` — so toggling doesn't require a restart (except for
+ * the provider split, which changes which providers are registered).
  */
 class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment() {
-    private val sharedPref = plugin.sharedPref
 
-    /** Add TV-friendly padding + focus outline to a view. */
+    /** Logo language options exposed in the UI. */
+    private val logoLanguages = listOf("en", "ja", "it", "fr", "de", "es", "pt", "ko", "zh")
+    private val logoLanguageLabels = listOf(
+        "Inglese (en)",
+        "Giapponese (ja)",
+        "Italiano (it)",
+        "Francese (fr)",
+        "Tedesco (de)",
+        "Spagnolo (es)",
+        "Portoghese (pt)",
+        "Coreano (ko)",
+        "Cinese (zh)",
+    )
+
+    /** Direct SharedPreferences handle — used for writes (PrefsHolder accessors are read-only). */
+    private val sharedPref: SharedPreferences?
+        get() = PrefsHolder.rawPrefs
+
     private fun View.makeTvCompatible() {
         this.setPadding(
             this.paddingLeft + 10,
@@ -84,6 +103,7 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
+        // ---- Header ----
         val headerTw: TextView? = view.findViewByName("header_tw")
         headerTw?.text = getString("header_tw")
 
@@ -91,18 +111,18 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
         saveBtn?.makeTvCompatible()
         saveBtn?.setImageDrawable(getDrawable("save_icon"))
 
+        // ---- Provider split ----
         val splitSwitch: Switch? = view.findViewByName("unique_switch")
         splitSwitch?.text = getString("unique_switch_text")
         val dubSwitch: Switch? = view.findViewByName("dub_switch")
         dubSwitch?.text = getString("dub_switch_text")
         val subSwitch: Switch? = view.findViewByName("sub_switch")
         subSwitch?.text = getString("sub_switch_text")
-
         val secondarySwitches: LinearLayout? = view.findViewByName("secondary_switches")
 
-        splitSwitch?.isChecked = sharedPref?.getBoolean("isSplit", false) ?: false
-        dubSwitch?.isChecked = sharedPref?.getBoolean("dubEnabled", false) ?: false
-        subSwitch?.isChecked = sharedPref?.getBoolean("subEnabled", false) ?: false
+        splitSwitch?.isChecked = PrefsHolder.isSplit
+        dubSwitch?.isChecked = PrefsHolder.dubEnabled
+        subSwitch?.isChecked = PrefsHolder.subEnabled
 
         secondarySwitches?.visibility =
             if (splitSwitch?.isChecked == true) View.VISIBLE else View.GONE
@@ -111,32 +131,68 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
             secondarySwitches?.visibility = if (b) View.VISIBLE else View.GONE
         }
 
+        // ---- Logo enrichment ----
+        val logoEnabledSwitch: Switch? = view.findViewByName("logo_enabled_switch")
+        logoEnabledSwitch?.text = getString("logo_enabled_switch_text")
+        logoEnabledSwitch?.isChecked = PrefsHolder.logoEnabled
+
+        val logoLangLabel: TextView? = view.findViewByName("logo_lang_label")
+        logoLangLabel?.text = getString("logo_lang_label")
+
+        val logoLangSpinner: Spinner? = view.findViewByName("logo_lang_spinner")
+        val currentLang = PrefsHolder.logoLanguage
+        val currentLangIndex = logoLanguages.indexOf(currentLang).coerceAtLeast(0)
+        logoLangSpinner?.adapter = ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_dropdown_item,
+            logoLanguageLabels
+        )
+        logoLangSpinner?.setSelection(currentLangIndex)
+
+        // ---- AniList enrichment ----
+        val anilistSwitch: Switch? = view.findViewByName("anilist_enricher_switch")
+        anilistSwitch?.text = getString("anilist_enricher_switch_text")
+        anilistSwitch?.isChecked = PrefsHolder.anilistEnricherEnabled
+
+        // ---- Cache management ----
+        val clearCacheBtn: Button? = view.findViewByName("clear_cache_btn")
+        clearCacheBtn?.text = getString("clear_cache_btn_text")
+        clearCacheBtn?.setOnClickListener {
+            TmdbLogoProvider.evictAll()
+            AniListEnricher.evictAll()
+            showToast("Cache logo + AniList pulita")
+        }
+
+        // ---- Save button ----
         saveBtn?.setOnClickListener {
-            with(sharedPref?.edit()) {
-                // If isSplit is ON but neither Dub nor Sub is enabled, fall back
-                // to the unified Core provider — otherwise the user would have
-                // zero providers after restart.
+            val sp = plugin.sharedPref ?: run {
+                showToast("Errore: SharedPreferences non disponibili")
+                return@setOnClickListener
+            }
+            with(sp.edit()) {
                 val effectiveSplit = splitSwitch?.isChecked == true &&
                     (dubSwitch?.isChecked == true || subSwitch?.isChecked == true)
-                this?.putBoolean("isSplit", effectiveSplit)
-                this?.putBoolean("dubEnabled", dubSwitch?.isChecked ?: false)
-                this?.putBoolean("subEnabled", subSwitch?.isChecked ?: false)
-                this?.apply()
+                putBoolean("isSplit", effectiveSplit)
+                putBoolean("dubEnabled", dubSwitch?.isChecked ?: false)
+                putBoolean("subEnabled", subSwitch?.isChecked ?: false)
+                putBoolean("logoEnabled", logoEnabledSwitch?.isChecked ?: true)
+                putBoolean("anilistEnricherEnabled", anilistSwitch?.isChecked ?: true)
+                logoLangSpinner?.let { spinner ->
+                    val selected = logoLanguages.getOrNull(spinner.selectedItemPosition) ?: "en"
+                    putString("logoLanguage", selected)
+                }
+                apply()
             }
-
-            // Clear the TMDB logo cache so the new provider variant re-fetches
-            // logos from scratch (useful if we ever switch language defaults).
-            TmdbLogoProvider.evictAll()
 
             AlertDialog.Builder(requireContext())
                 .setTitle("Save & Reload")
-                .setMessage("Changes have been saved. Do you want to restart the app to apply them?")
-                .setPositiveButton("Yes") { _, _ ->
+                .setMessage("Modifiche salvate. Vuoi riavviare l'app per applicarle?")
+                .setPositiveButton("Sì") { _, _ ->
                     dismiss()
                     restartApp()
                 }
                 .setNegativeButton("No") { _, _ ->
-                    showToast("Settings saved. Restart manually to apply.")
+                    showToast("Impostazioni salvate. Riavvia manualmente per applicarle.")
                     dismiss()
                 }
                 .show()
@@ -155,10 +211,10 @@ class Settings(private val plugin: AnimeWorldPlugin) : BottomSheetDialogFragment
                 context.startActivity(restartIntent)
                 Runtime.getRuntime().exit(0)
             } else {
-                showToast("Could not restart app")
+                showToast("Impossibile riavviare l'app")
             }
         } catch (e: Exception) {
-            showToast("Restart error: ${e.message}")
+            showToast("Errore riavvio: ${e.message}")
         }
     }
 }

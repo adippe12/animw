@@ -1,7 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="header_tw">Impostazioni AnimeWorld</string>
+
+    <!-- Provider split -->
     <string name="unique_switch_text">Divisione plugin</string>
     <string name="sub_switch_text">AnimeWorld Sub</string>
     <string name="dub_switch_text">AnimeWorld Dub</string>
+
+    <!-- Logo enrichment -->
+    <string name="logo_enabled_switch_text">Logo PNG trasparente (TMDB)</string>
+    <string name="logo_lang_label">Lingua preferita per il logo</string>
+    <string name="anilist_enricher_switch_text">Arricchimento AniList (cast, studio, banner)</string>
+
+    <!-- Cache management -->
+    <string name="clear_cache_btn_text">Pulisci cache logo + AniList</string>
 </resources>

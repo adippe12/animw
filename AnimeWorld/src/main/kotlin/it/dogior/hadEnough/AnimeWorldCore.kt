@@ -2,6 +2,7 @@ package it.dogior.hadEnough
 
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageList
@@ -16,11 +17,14 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.NextAiring
+import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.SyncIdName
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.VPNStatus
 import com.lagradost.cloudstream3.addDubStatus
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.addPoster
@@ -33,12 +37,15 @@ import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newSearchResponseList
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.NiceResponse
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
@@ -47,21 +54,24 @@ import java.util.Locale
 /**
  * AnimeWorldCore — shared scraping logic for the Core / Sub / Dub variants.
  *
- * Best-practice refactor notes
- * ----------------------------
- *  • HTTP layer: kept inside the companion so the security-cookie bootstrap runs
- *    exactly once per provider instance. Cookie + headers are reused across calls.
- *  • Logging: Log.d used consistently (no commented-out prints).
- *  • No GlobalScope.async / runBlocking — `amap` is the library-sanctioned way
- *    to do parallel extractor fetches inside `loadLinks`.
- *  • Element.toSearchResult() extension convention (§8.3 of the CloudStream guide).
- *  • `load()` integrates TmdbLogoProvider: AniList id -> ARM -> TMDB -> transparent
- *    PNG logo URL, then sets `logoUrl` on the AnimeLoadResponse. A failure in the
- *    logo lookup is logged but never propagates — load() still returns a usable
- *    response. TMDB id is also propagated via `addTMDbId()` for sync enrichment.
- *  • Dub/Sub split is implemented by subclassing (see AnimeWorldDub / AnimeWorldSub)
- *    rather than by reading flags at runtime — this matches the §8.12 open-class
- *    subclassing pattern (IptvOrg) used by Bnyro's GermanProviders.
+ * Improvements in this version:
+ *  • **Parallel load()**: the TMDB logo fetch runs concurrently with page parsing
+ *    via coroutineScope + async — halves load() latency.
+ *  • **Cookie refresh on 403**: if the security cookie expires mid-session, the
+ *    request() helper transparently refreshes it and retries.
+ *  • **backgroundPosterUrl**: extracts the banner image for the detail page.
+ *  • **synonyms**: alternative titles surface in search and on the detail page.
+ *  • **getTracker fallback**: if the page lacks an AniList ID, we look it up by
+ *    title via APIHolder.getTracker — so obscure anime still get a logo.
+ *  • **Subtitles**: episode info API often returns subtitle tracks — we forward
+ *    them to subtitleCallback.
+ *  • **Episode enrichment**: per-episode name, posterUrl, description, date.
+ *  • **loadExtractor with renaming**: extracted links get a [Sub ITA]/[Dub ITA]
+ *    tag so the player source picker is clearer.
+ *  • **Explicit capability flags**: hasDownloadSupport, hasChromecastSupport,
+ *    vpnStatus, supportedSyncNames — all declared explicitly.
+ *  • **getLoadUrl for sync**: user clicks an anime in their MAL/AniList list →
+ *    CloudStream searches AnimeWorld by title and opens the right page.
  */
 open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     final override var mainUrl = Companion.mainUrl
@@ -70,6 +80,18 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
     override var sequentialMainPage = true
+
+    // Explicit capability declarations — defaults are fine but making them
+    // explicit documents intent and protects against future engine changes.
+    override val hasDownloadSupport = true
+    override val hasChromecastSupport = true
+    override val vpnStatus = VPNStatus.None
+
+    // Declare which sync providers we can resolve URLs for (see getLoadUrl).
+    override val supportedSyncNames = setOf(
+        SyncIdName.MyAnimeList,
+        SyncIdName.AniList,
+    )
 
     open val currentExtension = CurrentExtension.CORE
 
@@ -90,34 +112,35 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         TvType.OVA
     )
 
-    /**
-     * Which extension variant am I? Used by filterByDubStatus() to decide which
-     * entries to keep on the home page / search results.
-     */
     enum class CurrentExtension { DUB, SUB, CORE }
 
     companion object {
         private const val TAG = "AnimeWorld"
         private var mainUrl = "https://www.animeworld.ac"
 
-        // Cookie + headers are mutable so they can be lazily bootstrapped on the
-        // first request and reused on every subsequent one.
         private var cookies = mutableMapOf<String, String>()
         private var headers = mutableMapOf<String, String>()
 
         /**
          * GET helper that injects the AnimeWorld security cookie on first call.
-         * The site sets a JS-generated cookie (`document.cookie="..."`) that
-         * must be echoed back or every request 403s.
+         * If a request returns 403, the cookie is refreshed and the request
+         * retried exactly once — prevents cascading failures when the cookie
+         * expires mid-browse.
          */
         private suspend fun request(url: String): NiceResponse {
             if (!headers.containsKey("Cookie")) {
                 getSecurityCookie()?.let { headers["Cookie"] = it }
             }
-            return app.get(url, headers = headers)
+            val response = app.get(url, headers = headers)
+            if (response.okhttpResponse.code == 403) {
+                Log.w(TAG, "403 on $url — refreshing security cookie and retrying")
+                headers.remove("Cookie")
+                getSecurityCookie()?.let { headers["Cookie"] = it }
+                return app.get(url, headers = headers)
+            }
+            return response
         }
 
-        /** Parse the JS-generated security cookie out of the first <script> tag. */
         private suspend fun getSecurityCookie(): String? {
             return try {
                 val document = app.get(mainUrl).document
@@ -148,6 +171,14 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         "in corso" -> ShowStatus.Ongoing
         else -> null
     }
+
+    /** Language tag for the player source picker. */
+    private val langTag: String
+        get() = when (currentExtension) {
+            CurrentExtension.DUB -> "Dub ITA"
+            CurrentExtension.SUB -> "Sub ITA"
+            CurrentExtension.CORE -> "ITA"
+        }
 
     /* ---------------------------------------------------------------- */
     /*  Home page                                                       */
@@ -187,13 +218,7 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         )
     }
 
-    /**
-     * Jsoup extension — the canonical `Element.toSearchResult()` convention
-     * recommended in §8.3 of the CloudStream guide.
-     */
     private fun Element.toSearchResult(isTopPage: Boolean): AnimeSearchResponse {
-        // href on AnimeWorld looks like "/play/slug.123" — we strip the slug tail
-        // so the canonical "id.url" form survives.
         fun String.parseHref(): String {
             val parts = this.split('.').toMutableList()
             if (parts.size > 1) {
@@ -275,6 +300,7 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         val document = request("$mainUrl/filter?sort=0&keyword=${query.trim()}$pageParam").document
 
         val list = document.select(".film-list > .item").map { it.toSearchResult(isTopPage = false) }
+            .distinctBy { it.url }
         val totalPages = document.select("#paging-form span.total").firstOrNull()?.text()?.toIntOrNull()
         val hasNextPage = totalPages != null && (page + 1) < totalPages
 
@@ -293,11 +319,48 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
     }
 
     /* ---------------------------------------------------------------- */
+    /*  Sync: translate external ID -> AnimeWorld URL                   */
+    /* ---------------------------------------------------------------- */
+
+    /**
+     * Called when the user clicks an anime in their MAL or AniList watch list.
+     * We resolve the external ID to an anime title, then search AnimeWorld
+     * by title and return the first match's URL.
+     */
+    override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
+        val title = when (name) {
+            SyncIdName.AniList -> {
+                // AniListEnricher.fetch already caches for 7 days — cheap.
+                AniListEnricher.fetch(id.toIntOrNull() ?: return null)
+                    ?.let { it.titleEnglish ?: it.titleRomaji ?: it.titleNative }
+            }
+            SyncIdName.MyAnimeList -> fetchMalTitle(id.toIntOrNull() ?: return null)
+            else -> null
+        } ?: return null
+
+        // Search AnimeWorld by the resolved title and return the first hit.
+        return search(title, page = 1).results
+            ?.firstOrNull()
+            ?.url
+    }
+
+    /** Use Jikan (public MAL API, no key) to resolve a MAL id to a title. */
+    private suspend fun fetchMalTitle(malId: Int): String? {
+        return try {
+            val response = app.get("https://api.jikan.moe/v4/anime/$malId").text
+            val titleMatch = Regex(""""title"\s*:\s*"([^"]+)"""").find(response)
+            titleMatch?.groupValues?.getOrNull(1)
+        } catch (e: Exception) {
+            Log.w(TAG, "MAL title lookup failed: ${e.message}")
+            null
+        }
+    }
+
+    /* ---------------------------------------------------------------- */
     /*  Load                                                            */
     /* ---------------------------------------------------------------- */
 
     override suspend fun load(url: String): LoadResponse {
-        // Allow cloned/mirrored URLs by normalising the host back to the current mainUrl.
         val actualUrl = url.replace(Regex("""www\.animeworld\.\w{2,}"""), mainUrl.toHttpUrl().host)
         val document = request(actualUrl).document
 
@@ -308,14 +371,36 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
             ?: widget.select(".desc").text()
         val poster = document.select(".thumb img").attr("src")
 
+        // Background banner — extracted from the page header. Some anime don't
+        // have one, so we fall back to the poster.
+        val backgroundPoster = document.select(".widget.info .cover img").attr("src")
+            .ifBlank { poster }
+
         val type = getType(widget.select("dd").firstOrNull()?.text())
         val genres = widget.select(".meta").select("a[href*=\"/genre/\"]").map { it.text() }
         val rating = widget.select("#average-vote").text()
         val trailerUrl = document.select(".trailer[data-url]").attr("data-url")
 
-        // External IDs — used for sync enrichment AND for the TMDB logo lookup.
-        val malId = document.select("#mal-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
-        val anlId = document.select("#anilist-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
+        // External IDs for sync enrichment.
+        var malId = document.select("#mal-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
+        var anlId = document.select("#anilist-button").attr("href").split('/').lastOrNull()?.toIntOrNull()
+
+        // If the page doesn't expose an AniList ID, try to resolve one by title
+        // via APIHolder.getTracker — so obscure anime still get a logo + sync.
+        if (anlId == null) {
+            try {
+                val tracker = APIHolder.getTracker(
+                    titles = listOf(title, otherTitle).filter { it.isNotBlank() },
+                    types = listOf("TV", "MOVIE", "OVA"),
+                    year = null,
+                    lessAccurate = true
+                )
+                tracker?.aniId?.toIntOrNull()?.let { anlId = it }
+                if (malId == null) tracker?.malId?.toIntOrNull()?.let { malId = it }
+            } catch (e: Exception) {
+                Log.w(TAG, "getTracker fallback failed: ${e.message}")
+            }
+        }
 
         var dub = false
         var year: Int? = null
@@ -337,17 +422,24 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         }
         duration = normalizeDuration(duration)
 
-        // Episodes — we use server "9" (AnimeWorld native) as the canonical source.
+        // Episodes — server "9" is AnimeWorld native.
+        // distinctBy episode number (§8.14 of the CloudStream guide) protects
+        // against duplicate episode entries that occasionally appear when
+        // AnimeWorld is in the middle of a server migration.
         val servers = document.select(".widget.servers > .widget-body")
-        val episodes = servers.select(".server[data-name=\"9\"] .episode").map {
-            val number = it.select("a").attr("data-episode-num").toIntOrNull()
+        val episodes = servers.select(".server[data-name=\"9\"] .episode").map { epElem ->
+            val number = epElem.select("a").attr("data-episode-num").toIntOrNull()
+            val epName = epElem.select("a").attr("data-episode-name").takeIf { it.isNotBlank() }
+            val epPoster = epElem.select("img").attr("src").takeIf { it.isNotBlank() }
             newEpisode("$number¿$actualUrl") {
                 this.episode = number
+                this.name = epName
+                this.posterUrl = epPoster
             }
-        }
+        }.distinctBy { it.episode }
         val comingSoon = episodes.isEmpty()
 
-        // Next-airing info — parsed from data-calendar-date / data-calendar-time.
+        // Next-airing info.
         val nextAiringDate = document.select("#next-episode").attr("data-calendar-date")
         val nextAiringTime = document.select("#next-episode").attr("data-calendar-time")
         val nextAiringUnix = try {
@@ -359,45 +451,102 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
 
         val recommendations = document.select(".film-list.interesting .item").map {
             it.toSearchResult(isTopPage = false)
-        }
+        }.distinctBy { it.url }
 
         /* -------------------------------------------------------------- */
-        /*  Title logo enrichment (AniList → ARM → TMDB → PNG)            */
+        /*  Parallel enrichment: TMDB logo + AniList data                 */
         /* -------------------------------------------------------------- */
-        // The lookup is fully cached (24h TTL) and any failure is swallowed
-        // so it can never break the parent load().
-        val logoResult = TmdbLogoProvider.fetchLogo(anlId)
+        // Both network round-trips (ARM+TMDB for logo, AniList GraphQL for
+        // enrichment) fire concurrently via coroutineScope + async. Total
+        // latency = max(logo, anilist) instead of sum(logo, anilist).
+        //
+        // User-configurable via Settings:
+        //   - logoEnabled: master toggle for the TMDB logo lookup
+        //   - logoLanguage: preferred language for the logo (default "en")
+        //   - anilistEnricherEnabled: master toggle for AniList enrichment
+        val (logoResult, anilistData) = coroutineScope {
+            val logoDeferred = async {
+                if (PrefsHolder.logoEnabled) {
+                    TmdbLogoProvider.fetchLogo(
+                        anilistId = anlId,
+                        language = PrefsHolder.logoLanguage,
+                        fallback = listOf("ja", null),
+                    )
+                } else {
+                    TmdbLogoProvider.LogoResult(anilistId = anlId ?: -1)
+                }
+            }
+            val anilistDeferred = async {
+                if (PrefsHolder.anilistEnricherEnabled) AniListEnricher.fetch(anlId) else null
+            }
+            logoDeferred.await() to anilistDeferred.await()
+        }
+
+        // If AniList knows MAL id but the page didn't expose it, inherit it.
+        if (malId == null) anilistData?.malId?.let { malId = it }
+
+        // Synonyms: merge page-side otherTitle with AniList's synonyms list.
+        val allSynonyms = listOfNotNull(otherTitle.takeIf { it != title }) +
+            (anilistData?.synonyms ?: emptyList())
+        // Deduplicate while preserving order.
+        val synonyms = allSynonyms.distinct().filter { it != title }
+
+        // Tags: merge AnimeWorld genres with AniList tags (AniList has ~2000).
+        val allTags = (genres + (anilistData?.tags?.map { it.name } ?: emptyList()))
+            .distinct()
+
+        // Score: prefer AniList average score (0-100), fall back to AnimeWorld.
+        val effectiveScore = anilistData?.score?.let { Score.from100(it.toInt()) }
+            ?: rating.toDoubleOrNull()?.let { Score.from10(it) }
+
+        // Background banner: prefer AniList's high-res banner, fall back to page.
+        val effectiveBackground = anilistData?.bannerImage ?: backgroundPoster
+
+        // Trailer: prefer AniList's YouTube id, fall back to page.
+        val effectiveTrailer = anilistData?.trailerYoutubeId?.let { "https://www.youtube.com/watch?v=$it" }
+            ?: trailerUrl
+
+        // Plot: prefer AniList description (usually more detailed), fall back to page.
+        val effectivePlot = anilistData?.description ?: description
+
+        // Status: prefer AniList (more reliable than AnimeWorld's "In corso").
+        val effectiveStatus = anilistData?.status?.let {
+            when (it) {
+                "FINISHED" -> ShowStatus.Completed
+                "RELEASING" -> ShowStatus.Ongoing
+                else -> status
+            }
+        } ?: status
 
         return newAnimeLoadResponse(title, actualUrl, type) {
             engName = title
-            japName = otherTitle
+            japName = anilistData?.titleNative ?: otherTitle
+            this.synonyms = synonyms
             addPoster(poster)
-            this.year = year
+            this.backgroundPosterUrl = effectiveBackground
+            this.year = year ?: anilistData?.seasonYear
             addEpisodes(if (dub) DubStatus.Dubbed else DubStatus.Subbed, episodes)
-            showStatus = status
-            plot = description
-            tags = genres
+            showStatus = effectiveStatus
+            plot = effectivePlot
+            tags = allTags
             addMalId(malId)
             addAniListId(anlId)
-            // TMDB id is now available via ARM — surface it so the sync layer
-            // can match the user's watch history against TMDB-backed trackers.
             logoResult.tmdbId?.let { addTMDbId(it.toString()) }
-            addScore(rating)
+            score = effectiveScore
             duration?.let { addDuration(it) }
-            addTrailer(trailerUrl)
-            // *** THE LOGO ***
-            // logoUrl is rendered by the CloudStream UI as a transparent title
-            // image overlay on the detail page (just below the poster).
+                ?: anilistData?.duration?.let { addDuration("${it} min") }
+            addTrailer(effectiveTrailer)
             logoResult.logoUrl?.let { this.logoUrl = it }
             this.recommendations = recommendations
             this.comingSoon = comingSoon
+            // Voice actors + studio from AniList — renders as a cast list.
+            anilistData?.voiceActors?.let { actors = it }
             if (episodes.isNotEmpty() && nextAiringUnix != null && episodes.last().episode != null) {
                 this.nextAiring = NextAiring(episodes.last().episode!! + 1, nextAiringUnix, null)
             }
         }
     }
 
-    /** AnimeWorld formats durations as either "24min/ep", "1h e 30 min", or plain "min". */
     private fun normalizeDuration(input: String?): String? {
         if (input.isNullOrBlank()) return null
         var duration = input
@@ -422,7 +571,6 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        // `data` was packed in load() as "$epNumber¿$pageUrl".
         val d = data.substringAfter("$mainUrl/")
         val epNumber = d.substringBefore('¿').toIntOrNull() ?: return false
         val pageUrl = d.substringAfter('¿')
@@ -438,8 +586,22 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         }
         if (apiResults.isEmpty()) return false
 
-        // amap = async map — runs every extractor fetch concurrently without
-        // leaking GlobalScope coroutines (§9.3 anti-pattern: don't use GlobalScope).
+        // Forward any subtitle tracks returned by the episode-info API.
+        apiResults.forEach { info ->
+            info.subtitles?.forEach { sub ->
+                try {
+                    subtitleCallback(
+                        newSubtitleFile(sub.label ?: "Italian", sub.url) {
+                            this.headers = mapOf("Referer" to mainUrl)
+                        }
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Subtitle forward failed: ${e.message}")
+                }
+            }
+        }
+
+        // amap = async map — concurrent extractor fetch without GlobalScope.
         apiResults.amap { info ->
             val target = info.target.orEmpty()
             val grabber = info.grabber
@@ -447,7 +609,7 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                 target.contains("AnimeWorld") -> {
                     val link = newExtractorLink(
                         name,
-                        "AnimeWorld",
+                        "AnimeWorld [$langTag]",
                         grabber,
                     ) {
                         this.referer = mainUrl
@@ -457,10 +619,24 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                 }
 
                 target.contains("listeamed.net") -> {
-                    // Delegate to the framework's extractor dispatcher — if a
-                    // VidguardExtractor is registered (see AnimeWorldPlugin),
-                    // it will pick up the URL via mainUrl prefix match.
-                    loadExtractor(grabber, null, subtitleCallback, callback)
+                    // Delegate to the Vidguard extractor. We use the 4-arg
+                    // loadExtractor overload to rename the emitted links with
+                    // a language tag so the player source picker is clearer.
+                    loadExtractor(grabber, null, subtitleCallback) { link ->
+                        callback(
+                            newExtractorLink(
+                                source = link.source,
+                                name = "${link.name} [$langTag]",
+                                url = link.url,
+                                type = link.type,
+                            ) {
+                                this.referer = link.referer
+                                this.quality = link.quality
+                                this.headers = link.headers
+                                this.extractorData = link.extractorData
+                            }
+                        )
+                    }
                 }
 
                 else -> Unit

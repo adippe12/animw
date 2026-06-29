@@ -3,32 +3,38 @@ package it.dogior.hadEnough
 import android.util.Base64
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.USER_AGENT
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.network.WebViewResolver
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.NativeJSON
 import org.mozilla.javascript.NativeObject
 import org.mozilla.javascript.Scriptable
 
 /**
- * Vidguard (listeamed.net) extractor.
+ * Vidguard (listeamed.net) extractor — two-stage resolver.
  *
- * The embed page contains an obfuscated `eval(...)` script that, when run,
- * populates a global `svg` object whose `stream` field is a sig-encoded m3u8
- * URL. We:
- *   1. Fetch the page HTML.
- *   2. Find the script tag containing `eval`.
- *   3. Run it under Rhino (with a 3 MB stack — Rhino needs the headroom).
- *   4. Read back the `svg` object as JSON.
- *   5. sigDecode() the `stream` field to recover the real m3u8 URL.
+ * Stage 1 — Rhino eval (primary):
+ *   The embed page contains an obfuscated `eval(...)` script that, when run
+ *   under Rhino, populates a global `svg` object whose `stream` field is a
+ *   sig-encoded m3u8 URL. We sigDecode() it to recover the real URL.
  *
- * The original implementation logged the full obfuscated script with Log.d —
- * removed because it pollutes logcat with kilobytes of noise per request.
+ * Stage 2 — WebViewResolver fallback:
+ *   If Rhino fails (script pattern changed, stack overflow, etc.), we fall
+ *   back to a real Android WebView that executes the page's JS natively and
+ *   intercepts any outgoing m3u8 request. This is more reliable but slower
+ *   (~3-5s vs <500ms for Rhino).
+ *
+ * Final step:
+ *   M3u8Helper.generateM3u8 expands the master playlist into one
+ *   ExtractorLink per quality variant (1080p, 720p, 480p…).
  */
 class VidguardExtractor : ExtractorApi() {
     override val mainUrl = "https://listeamed.net/"
@@ -37,7 +43,6 @@ class VidguardExtractor : ExtractorApi() {
 
     private companion object {
         const val TAG = "AnimeWorld:VidGuard"
-        // Rhino needs a larger-than-default stack for the Vidguard eval payload.
         const val RHINO_STACK_BYTES = 3_000_000L
     }
 
@@ -47,64 +52,80 @@ class VidguardExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val document = try {
-            app.get(url).document
-        } catch (e: Exception) {
-            Log.w(TAG, "GET $url failed: ${e.message}")
+        val playlistUrl = resolveViaRhino(url) ?: resolveViaWebView(url) ?: run {
+            Log.w(TAG, "Both Rhino and WebView fallback failed for $url")
             return
         }
 
-        val script = document.selectFirst("script:containsData(eval)")?.data() ?: run {
-            Log.w(TAG, "No eval() script found on page")
-            return
-        }
-
-        val decodedScript = runJS(script) ?: run {
-            Log.w(TAG, "Rhino eval returned empty result")
-            return
-        }
-
-        val json = tryParseJson<SvgObject>(decodedScript) ?: run {
-            Log.w(TAG, "Could not parse svg JSON: $decodedScript")
-            return
-        }
-
-        val playlistUrl = sigDecode(json.stream) ?: run {
-            Log.w(TAG, "sigDecode returned null for stream=${json.stream}")
-            return
-        }
-
-        callback.invoke(
-            newExtractorLink(
-                name,
-                name,
-                playlistUrl,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.referer = mainUrl
-                this.quality = Qualities.Unknown.value
+        // Expand the master m3u8 into multiple quality variants.
+        try {
+            val links = M3u8Helper.generateM3u8(
+                source = name,
+                streamUrl = playlistUrl,
+                referer = mainUrl,
+                quality = null,              // resolved per-variant from RESOLUTION
+                headers = mapOf("User-Agent" to USER_AGENT),
+                name = name,
+            )
+            if (links.isEmpty()) {
+                callback.invoke(
+                    newExtractorLink(name, name, playlistUrl, type = ExtractorLinkType.M3U8) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            } else {
+                links.forEach(callback)
             }
-        )
+        } catch (e: Exception) {
+            Log.w(TAG, "M3u8Helper failed, falling back to raw URL: ${e.message}")
+            callback.invoke(
+                newExtractorLink(name, name, playlistUrl, type = ExtractorLinkType.M3U8) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
     }
 
-    /**
-     * sigDecode — Vidguard's URL signature is a base64-of-xor-with-2 payload
-     * that's been character-swapped and reversed twice. We undo all of that.
-     *
-     * Returns the input URL with its `sig=...` parameter replaced by the
-     * decoded signature, or null on any failure.
-     */
+    /* ---------------------------------------------------------------- */
+    /*  Stage 1: Rhino eval                                             */
+    /* ---------------------------------------------------------------- */
+
+    private suspend fun resolveViaRhino(url: String): String? {
+        return try {
+            val document = app.get(url).document
+            val script = document.selectFirst("script:containsData(eval)")?.data() ?: run {
+                Log.w(TAG, "Rhino: no eval() script found on page")
+                return null
+            }
+            val decodedScript = runJS(script) ?: run {
+                Log.w(TAG, "Rhino: eval returned empty result")
+                return null
+            }
+            val json = tryParseJson<SvgObject>(decodedScript) ?: run {
+                Log.w(TAG, "Rhino: could not parse svg JSON")
+                return null
+            }
+            sigDecode(json.stream) ?: run {
+                Log.w(TAG, "Rhino: sigDecode returned null")
+                return null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Rhino stage failed: ${e.message}")
+            null
+        }
+    }
+
     private fun sigDecode(url: String): String? {
         return try {
             val sig = url.substringAfter("sig=", "").substringBefore('&')
             if (sig.isEmpty()) return null
 
-            // Step 1: hex-decode 2-bytes-at-a-time, XOR each byte with 2.
             val xored = sig.chunked(2).joinToString("") { chunk ->
                 (Integer.parseInt(chunk, 16) xor 2).toChar().toString()
             }
 
-            // Step 2: pad and base64-decode.
             val padding = when (xored.length % 4) {
                 2 -> "=="
                 3 -> "="
@@ -114,8 +135,6 @@ class VidguardExtractor : ExtractorApi() {
                 Base64.decode((xored + padding).toByteArray(Charsets.UTF_8), Base64.DEFAULT)
             )
 
-            // Step 3: drop last 5 chars, reverse, swap every adjacent char pair,
-            //         then drop last 5 chars again.
             val swapped = decoded.dropLast(5).reversed().toCharArray().apply {
                 for (i in indices step 2) {
                     if (i + 1 < size) {
@@ -131,14 +150,6 @@ class VidguardExtractor : ExtractorApi() {
         }
     }
 
-    /**
-     * Run an obfuscated JS string under Rhino and return whatever the global
-     * `svg` variable holds (serialized to JSON if it's an object).
-     *
-     * Rhino is single-threaded per Context — we run it on a dedicated thread
-     * with a larger stack to avoid blowing the default 512 KB stack on
-     * deeply-nested eval payloads.
-     */
     private fun runJS(hideMyHtmlContent: String): String {
         var result = ""
         val runnable = Runnable {
@@ -146,14 +157,9 @@ class VidguardExtractor : ExtractorApi() {
             try {
                 rhino.optimizationLevel = -1
                 val scope: Scriptable = rhino.initSafeStandardObjects()
-                // Many packers reference `window` — alias it to the global scope.
                 scope.put("window", scope, scope)
                 rhino.evaluateString(
-                    scope,
-                    hideMyHtmlContent,
-                    "JavaScript",
-                    1,
-                    null,
+                    scope, hideMyHtmlContent, "JavaScript", 1, null,
                 )
                 val svgObject = scope.get("svg", scope)
                 result = if (svgObject is NativeObject) {
@@ -164,7 +170,6 @@ class VidguardExtractor : ExtractorApi() {
                     Context.toString(svgObject)
                 }
             } catch (e: Throwable) {
-                // Catch Throwable — Rhino throws both Error and Exception subtypes.
                 Log.w(TAG, "Rhino eval failed: ${e.message}")
             } finally {
                 Context.exit()
@@ -183,7 +188,44 @@ class VidguardExtractor : ExtractorApi() {
         return result
     }
 
-    /** Subset of the JS `svg` object we care about. */
+    /* ---------------------------------------------------------------- */
+    /*  Stage 2: WebViewResolver fallback                               */
+    /* ---------------------------------------------------------------- */
+
+    /**
+     * If Rhino can't decode the script (script pattern changed, JS uses
+     * APIs Rhino doesn't support, etc.), spin up a real Android WebView
+     * that executes the page's JS natively and intercept any outgoing
+     * m3u8 request. Slower (~3-5s) but more reliable.
+     *
+     * Requires `usesWebView = true` on the provider OR running on a
+     * device that has a WebView component (all Android phones do).
+     */
+    private suspend fun resolveViaWebView(url: String): String? {
+        return try {
+            Log.i(TAG, "Falling back to WebViewResolver for $url")
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""(m3u8|master\.txt|\.m3u8)"""),
+                additionalUrls = emptyList(),
+                userAgent = USER_AGENT,
+                useOkhttp = false,           // required for JS-protected pages
+                timeout = 15_000L,
+            )
+            val (matched, _) = resolver.resolveUsingWebView(url, referer = mainUrl)
+            val streamUrl = matched?.url?.toString()
+            if (streamUrl.isNullOrBlank()) {
+                Log.w(TAG, "WebViewResolver returned no m3u8 URL")
+                null
+            } else {
+                Log.i(TAG, "WebViewResolver intercepted: $streamUrl")
+                streamUrl
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "WebView fallback failed: ${e.message}")
+            null
+        }
+    }
+
     data class SvgObject(
         val stream: String,
         val hash: String? = null,

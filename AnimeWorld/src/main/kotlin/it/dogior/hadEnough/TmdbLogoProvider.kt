@@ -3,6 +3,9 @@ package it.dogior.hadEnough
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
@@ -19,49 +22,35 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * All endpoints used are 100% public — ZERO API keys.
  *
- * Verified endpoints:
- *   - https://arm.haglund.dev/api/v2/ids?source=anilist&id={ID}
- *   - https://www.themoviedb.org/tv/{tmdb_id}/images/logos?image_language={lang}
- *   - https://image.tmdb.org/t/p/original/{path}.png
- *
- * Caching:
- *   - Result is cached in-memory keyed by AniList id for [CACHE_TTL_MS].
- *   - A negative result (no logo found) is also cached, so we don't hammer ARM/TMDB
- *     on every `load()` call for obscure anime.
- *
- * Error handling:
- *   - Every step is wrapped in try/catch — a logo lookup failure must NEVER
- *     break the parent `load()` flow. The provider still returns a perfectly
- *     usable LoadResponse, just without a logoUrl.
+ * Improvements over the original JS:
+ *   - **Parallel language fetch**: fires `en` + `ja` + `null` concurrently instead of
+ *     sequentially. Total latency = max(langs) instead of sum(langs).
+ *   - **TMDB type detection**: ARM returns `themoviedb_type` ("tv" | "movie") —
+ *     we use it to hit `/movie/{id}/images/logos` for movies instead of always `/tv/`.
+ *   - **24h in-memory cache** with negative-result caching.
+ *   - **Bulletproof error handling**: every step wrapped in try/catch — a logo
+ *     failure never propagates to the parent load().
  */
 object TmdbLogoProvider {
 
     private const val TAG = "AnimeWorld:LogoProvider"
 
     private const val ARM_API = "https://arm.haglund.dev/api/v2/ids"
-    private const val TMDB_LOGO_PAGE = "https://www.themoviedb.org/tv/{id}/images/logos"
+    private const val TMDB_TV_LOGO_PAGE = "https://www.themoviedb.org/tv/{id}/images/logos"
+    private const val TMDB_MOVIE_LOGO_PAGE = "https://www.themoviedb.org/movie/{id}/images/logos"
     private const val TMDB_IMAGE_CDN = "https://image.tmdb.org/t/p/original"
 
-    /** Cache TTL — 24h. Logos essentially never change, but TMDB/ARM can have outages. */
+    /** Cache TTL — 24h. Logos essentially never change. */
     private const val CACHE_TTL_MS = 24L * 60 * 60 * 1000
 
-    /** In-memory cache: AniList id -> (timestamp, result). */
     private val cache = ConcurrentHashMap<Int, CacheEntry>()
 
     private data class CacheEntry(val timestamp: Long, val result: LogoResult)
 
-    /**
-     * Final result returned to the provider.
-     *
-     * @property anilistId     the input AniList id
-     * @property tmdbId        TMDB id resolved via ARM, or null if not mapped
-     * @property language      the language code that actually yielded a logo (e.g. "en", "ja", "any")
-     * @property logoUrl       first available transparent PNG URL, or null if none found
-     * @property allLogos      every logo URL discovered in the resolved language
-     */
     data class LogoResult(
         val anilistId: Int,
         val tmdbId: Int? = null,
+        val tmdbType: String? = null,
         val language: String? = null,
         val logoUrl: String? = null,
         val allLogos: List<String> = emptyList(),
@@ -70,14 +59,11 @@ object TmdbLogoProvider {
     /**
      * End-to-end lookup: AniList ID -> first available transparent PNG logo URL.
      *
-     * Strategy mirrors the original JS:
-     *   1. Try the requested [language] (default "en").
-     *   2. If empty, try every language in [fallback] (default ["ja"]).
-     *   3. As a last resort, request the page with no `image_language` filter (`null`).
-     *
-     * @param anilistId the AniList id parsed from the AnimeWorld detail page
-     * @param language  preferred language (ISO 639-1)
-     * @param fallback  languages to try if the preferred one has no logos
+     * Strategy:
+     *   1. Check cache (24h TTL, includes negative results).
+     *   2. ARM: AniList id -> TMDB id + type.
+     *   3. Fire ALL candidate languages CONCURRENTLY (en, ja, null).
+     *   4. Pick the first language (in priority order) that has logos.
      */
     suspend fun fetchLogo(
         anilistId: Int?,
@@ -86,14 +72,14 @@ object TmdbLogoProvider {
     ): LogoResult {
         if (anilistId == null || anilistId <= 0) return LogoResult(anilistId = anilistId ?: -1)
 
-        // 1. Check cache
+        // 1. Cache check
         cache[anilistId]?.let { entry ->
             if (System.currentTimeMillis() - entry.timestamp < CACHE_TTL_MS) {
                 return entry.result
             }
         }
 
-        // 2. AniList -> TMDB id (via ARM)
+        // 2. AniList -> TMDB id + type (via ARM)
         val mappings = anilistToMappings(anilistId)
         val tmdbId = mappings?.themoviedb
         if (tmdbId == null) {
@@ -102,15 +88,25 @@ object TmdbLogoProvider {
             return miss
         }
 
-        // 3. Try every language in order until we find at least one logo.
+        val tmdbType = mappings.themoviedbType ?: "tv"
+
+        // 3. Build priority-ordered language list (no duplicates, preserves order)
         val languagesToTry = buildList {
             add(language)
             fallback.filter { it != language }.forEach(::add)
         }
 
-        var resolved: LogoResult = LogoResult(anilistId = anilistId, tmdbId = tmdbId)
+        // 4. Fetch ALL languages concurrently — total latency = max(langs), not sum(langs).
+        val resultsByLang: Map<String?, List<String>> = coroutineScope {
+            languagesToTry.map { lang ->
+                async { lang to tmdbIdToLogoUrls(tmdbId, tmdbType, lang) }
+            }.awaitAll().toMap()
+        }
+
+        // 5. Pick the first language (in priority order) that has logos.
+        var resolved = LogoResult(anilistId = anilistId, tmdbId = tmdbId, tmdbType = tmdbType)
         for (lang in languagesToTry) {
-            val logos = tmdbIdToLogoUrls(tmdbId, lang)
+            val logos = resultsByLang[lang].orEmpty()
             if (logos.isNotEmpty()) {
                 resolved = resolved.copy(
                     language = lang ?: "any",
@@ -125,23 +121,14 @@ object TmdbLogoProvider {
         return resolved
     }
 
-    /**
-     * ARM API call: AniList id -> full mapping (MAL/AniDB/Kitsu/TVDB/IMDB/TMDB).
-     * Returns null if the AniList id isn't in ARM's database (rare anime) or
-     * if the request fails for any reason.
-     */
     private suspend fun anilistToMappings(anilistId: Int): ArmMappings? {
         return try {
             val url = "$ARM_API?source=anilist&id=$anilistId"
-            val response = app.get(
-                url = url,
-                headers = mapOf("Accept" to "application/json")
-            )
+            val response = app.get(url, headers = mapOf("Accept" to "application/json"))
             if (!response.okhttpResponse.isSuccessful) {
                 Log.w(TAG, "ARM API non-OK status: ${response.okhttpResponse.code}")
                 return null
             }
-            // ARM returns `null` (HTTP 200 with body "null") when the id isn't mapped.
             val body = response.text
             if (body.isBlank() || body.trim() == "null") return null
             tryParseJson<ArmMappings>(body)
@@ -154,12 +141,14 @@ object TmdbLogoProvider {
     /**
      * Scrape the public TMDB `/images/logos` HTML page for transparent PNG logo URLs.
      *
-     * @param tmdbId   TMDB show id
-     * @param language ISO 639-1 code, or null to fetch the default (unfiltered) page
+     * @param tmdbId   TMDB show/movie id
+     * @param tmdbType "tv" or "movie" — determines the URL path
+     * @param language ISO 639-1 code, or null for the unfiltered default page
      */
-    private suspend fun tmdbIdToLogoUrls(tmdbId: Int, language: String?): List<String> {
+    private suspend fun tmdbIdToLogoUrls(tmdbId: Int, tmdbType: String, language: String?): List<String> {
+        val template = if (tmdbType == "movie") TMDB_MOVIE_LOGO_PAGE else TMDB_TV_LOGO_PAGE
         val pageUrl = buildString {
-            append(TMDB_LOGO_PAGE.replace("{id}", tmdbId.toString()))
+            append(template.replace("{id}", tmdbId.toString()))
             if (!language.isNullOrBlank()) {
                 append("?image_language=")
                 append(URLEncoder.encode(language, "UTF-8"))
@@ -175,7 +164,6 @@ object TmdbLogoProvider {
                 )
             )
             if (!response.okhttpResponse.isSuccessful) {
-                // 404 means "this anime isn't on TMDB" — not an error, just no logos.
                 if (response.okhttpResponse.code != 404) {
                     Log.w(TAG, "TMDB page non-OK status: ${response.okhttpResponse.code}")
                 }
@@ -187,24 +175,14 @@ object TmdbLogoProvider {
             return emptyList()
         }
 
-        // Pattern: image.tmdb.org/t/p/{original|w500|w300}/<hash>.png
-        // Hashes are alphanumeric (no dots, no slashes) — TMDB uses this format for poster/logo files.
         val regex = Regex(
             """image\.tmdb\.org/t/p/(?:original|w500|w300)/([a-zA-Z0-9]+)\.png"""
         )
-        // LinkedHashSet preserves insertion order while deduplicating.
         val hashes = LinkedHashSet<String>()
         regex.findAll(html).forEach { hashes.add(it.groupValues[1]) }
         return hashes.map { "$TMDB_IMAGE_CDN/$it.png" }
     }
 
-    /** Drop the cached entry for an AniList id (used by the Settings "clear cache" action). */
-    fun evict(anilistId: Int) {
-        cache.remove(anilistId)
-    }
-
-    /** Drop every cached entry. */
-    fun evictAll() {
-        cache.clear()
-    }
+    fun evict(anilistId: Int) = cache.remove(anilistId)
+    fun evictAll() = cache.clear()
 }
