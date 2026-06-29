@@ -515,18 +515,34 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
             val anilistDeferred = async {
                 if (PrefsHolder.anilistEnricherEnabled) AniListEnricher.fetch(anlId) else null
             }
-            // Episode stills/titles from TMDB — fetch ALL seasons (not just S1)
-            // because anime franchises are often split: AW has "JJK" + "JJK 2"
-            // as separate pages, AniList has separate IDs, but TMDB has ONE show
-            // with multiple seasons. We match by air date later.
+            // Episode stills/titles from TMDB.
+            // Strategy: try ARM's season first; if 404 (season doesn't exist on
+            // TMDB, e.g. JJK S2 where ARM says season=2 but TMDB only has season 1),
+            // fall back to season 1.
             val tmdbEpisodesDeferred = async {
                 if (PrefsHolder.anilistEnricherEnabled && episodes.isNotEmpty()) {
-                    val tmdbId = TmdbLogoProvider.fetchLogo(anlId).tmdbId
+                    val logoRes = TmdbLogoProvider.fetchLogo(anlId)
+                    val tmdbId = logoRes.tmdbId
+                    val armSeason = logoRes.tmdbSeason ?: 1
                     if (tmdbId != null) {
-                        TmdbEpisodeProvider.fetchShowData(
+                        // Try ARM's season first.
+                        var seasonData = TmdbEpisodeProvider.fetchSeasonData(
                             tmdbId = tmdbId,
+                            season = armSeason,
                             language = PrefsHolder.logoLanguage,
                         )
+                        // If ARM's season was empty (404), fall back to season 1.
+                        // This handles the JJK case: ARM says season=2, TMDB 404s,
+                        // but season 1 has all 59 episodes.
+                        if (seasonData.allEpisodes.isEmpty() && armSeason != 1) {
+                            Log.i(TAG, "ARM season $armSeason was empty/404, falling back to season 1")
+                            seasonData = TmdbEpisodeProvider.fetchSeasonData(
+                                tmdbId = tmdbId,
+                                season = 1,
+                                language = PrefsHolder.logoLanguage,
+                            )
+                        }
+                        seasonData
                     } else {
                         TmdbEpisodeProvider.SeasonData()
                     }
@@ -541,46 +557,45 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
         if (malId == null) anilistData?.malId?.let { malId = it }
 
         /* -------------------------------------------------------------- */
-        /*  Episode enrichment — match by air date across all TMDB seasons */
+        /*  Episode enrichment — offset detection via air date matching   */
         /* -------------------------------------------------------------- */
-        // Problem: AnimeWorld may have "JJK" + "JJK 2" as separate pages,
-        // each with its own AniList ID. ARM maps both to the SAME TMDB show
-        // (which has season 1 + season 2). We can't ask ARM "which season?".
+        // Problem: TMDB may collapse multiple anime seasons into ONE TMDB season.
+        // Example: JJK S1+S2+S3 = TMDB season 1 with 59 episodes.
         //
-        // Solution: AniList gives us the airing timestamp of each episode.
-        // TMDB gives us the air date of each episode per season. We match
-        // episodes whose air dates align (same calendar day).
+        // Solution: "offset detection"
+        //   1. AniList gives us airingAt (Unix seconds) for each episode
+        //   2. TMDB gives us airDateUnix for each episode
+        //   3. Find the TMDB episode whose air date matches AniList ep 1
+        //   4. offset = that index; for AW ep N → TMDB allEpisodes[offset + N - 1]
         //
-        // Fallback: if no air date match, try (season=1, episode=N) — the
-        // common case for single-season anime.
+        // We compare Unix timestamps with a 2-day tolerance (TMDB dates are
+        // JP-local midnight, AniList are exact airing times in UTC).
         val airingSchedule = anilistData?.airingSchedule ?: emptyMap()
+        val tmdbAllEps = tmdbEpisodes.allEpisodes
+
+        val offset = detectEpisodeOffset(airingSchedule, tmdbAllEps)
+        if (offset >= 0) {
+            val matchedEp = tmdbAllEps.getOrNull(offset)
+            Log.i(TAG, "Episode offset=$offset → TMDB S${matchedEp?.season}E${matchedEp?.episode}" +
+                " (title: ${matchedEp?.title})")
+        }
+
         val enrichedEpisodes = episodes.map { ep ->
             val epNum = ep.episode
-
-            // Step 1: try to match by air date.
-            // AniList airingAt is Unix seconds; TMDB air_date is "YYYY-MM-DD".
             val airingTs = epNum?.let { airingSchedule[it] }
-            val tmdbEpByDate = airingTs?.let { ts ->
-                val dateStr = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-                    .format(java.util.Date(ts * 1000))
-                tmdbEpisodes.byAirDate[dateStr]
-            }
 
-            // Step 2: fallback to season 1 + episode number (common case).
-            val tmdbEp = tmdbEpByDate
-                ?: epNum?.let { tmdbEpisodes.bySeasonEpisode[1 to it] }
+            // Use offset to index into the flat TMDB episode list.
+            val tmdbEp = if (offset >= 0 && epNum != null) {
+                tmdbAllEps.getOrNull(offset + epNum - 1)
+            } else null
 
             newEpisode(ep.data) {
                 this.episode = ep.episode
-                // Name: prefer AnimeWorld's, fall back to TMDB, then "Episodio N"
                 this.name = ep.name
                     ?: tmdbEp?.title
                     ?: epNum?.let { "Episodio $it" }
-                // Poster: prefer AnimeWorld's, fall back to TMDB still
                 this.posterUrl = ep.posterUrl ?: tmdbEp?.stillUrl
-                // Description: prefer AnimeWorld's, fall back to TMDB overview
                 this.description = ep.description ?: tmdbEp?.overview
-                // Air date from AniList airing schedule
                 if (airingTs != null) {
                     this.date = airingTs
                 }
@@ -647,6 +662,51 @@ open class AnimeWorldCore(isSplit: Boolean = false) : MainAPI() {
                 this.nextAiring = NextAiring(enrichedEpisodes.last().episode!! + 1, nextAiringUnix, null)
             }
         }
+    }
+
+    /**
+     * Detect the offset between AnimeWorld/AniList episode numbers and TMDB's
+     * flat episode list.
+     *
+     * Example: JJK S2 on AnimeWorld has eps 1-23. TMDB has ONE season with
+     * 59 episodes (S1=1-24, S2=25-47, S3=48-59). AniList says JJK S2 ep 1
+     * aired on 2023-07-06. We scan TMDB's episode list for an episode airing
+     * around that date → index 24 (TMDB ep 25). So offset=24, and
+     * AW ep N → TMDB index 24+N-1.
+     *
+     * Uses Unix timestamp comparison with a 2-day tolerance (TMDB dates are
+     * JP-local midnight, AniList are exact airing times in UTC — there can
+     * be a few hours of difference).
+     *
+     * @return the TMDB allEpisodes index matching AniList ep 1, or -1 if no match
+     */
+    private fun detectEpisodeOffset(
+        airingSchedule: Map<Int, Long>,
+        tmdbEpisodes: List<TmdbEpisodeProvider.EpisodeData>,
+    ): Int {
+        if (airingSchedule.isEmpty() || tmdbEpisodes.isEmpty()) return -1
+
+        val toleranceSeconds = 2L * 24 * 60 * 60  // 2 days
+
+        // Try matching ep 1, then ep 2, ..., up to ep 5 — in case ep 1's date is missing.
+        for (anilistEp in 1..5) {
+            val airingTs = airingSchedule[anilistEp] ?: continue
+
+            // Find the first TMDB episode whose air date is within tolerance.
+            val matchIndex = tmdbEpisodes.indexOfFirst { ep ->
+                val tmdbTs = ep.airDateUnix ?: return@indexOfFirst false
+                kotlin.math.abs(tmdbTs - airingTs) <= toleranceSeconds
+            }
+            if (matchIndex >= 0) {
+                // matchIndex corresponds to AniList ep `anilistEp`.
+                // For AniList ep 1, offset = matchIndex - (anilistEp - 1).
+                return matchIndex - anilistEp + 1
+            }
+        }
+
+        // Fallback: if no date match, assume AW ep 1 = TMDB ep 1.
+        // This works for single-season anime where TMDB ep N = AW ep N.
+        return 0
     }
 
     private fun normalizeDuration(input: String?): String? {

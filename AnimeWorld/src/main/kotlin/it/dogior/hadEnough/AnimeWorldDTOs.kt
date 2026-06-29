@@ -64,4 +64,6 @@ data class ArmMappings(
     @JsonProperty("imdb") val imdb: String? = null,        // "tt1234567"
     @JsonProperty("themoviedb") val themoviedb: Int? = null,
     @JsonProperty("themoviedb_type") val themoviedbType: String? = null, // "tv" | "movie"
+    @JsonProperty("themoviedb-season") val themoviedbSeason: Int? = null,
+    @JsonProperty("thetvdb-season") val thetvdbSeason: Int? = null,
 )

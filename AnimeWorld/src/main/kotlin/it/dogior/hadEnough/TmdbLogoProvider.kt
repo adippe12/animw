@@ -51,6 +51,9 @@ object TmdbLogoProvider {
         val anilistId: Int,
         val tmdbId: Int? = null,
         val tmdbType: String? = null,
+        /** ARM's best-guess TMDB season number. May be WRONG (e.g. JJK S2 has
+         * season=2 in ARM but TMDB only has season 1 with all episodes). */
+        val tmdbSeason: Int? = null,
         val language: String? = null,
         val logoUrl: String? = null,
         val allLogos: List<String> = emptyList(),
@@ -104,7 +107,12 @@ object TmdbLogoProvider {
         }
 
         // 5. Pick the first language (in priority order) that has logos.
-        var resolved = LogoResult(anilistId = anilistId, tmdbId = tmdbId, tmdbType = tmdbType)
+        var resolved = LogoResult(
+            anilistId = anilistId,
+            tmdbId = tmdbId,
+            tmdbType = tmdbType,
+            tmdbSeason = mappings.themoviedbSeason,
+        )
         for (lang in languagesToTry) {
             val logos = resultsByLang[lang].orEmpty()
             if (logos.isNotEmpty()) {

@@ -83,8 +83,8 @@ object AniListEnricher {
 
     /** GraphQL query — single request, all fields, no nested fragments. */
     private val QUERY = """
-        query (id: Int) {
-          Media(id: id, type: ANIME) {
+        query (${'$'}id: Int) {
+          Media(id: ${'$'}id, type: ANIME) {
             id
             idMal
             title { romaji english native }
