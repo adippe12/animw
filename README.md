@@ -103,13 +103,10 @@ Mapped against §9 "Anti-patterns & Pitfalls to Avoid" of the CloudStream guide:
 
 ## Build
 
-Requirements: JDK 17, Android SDK 35.
+Requirements: JDK 21, Android SDK 36, Gradle 9.4.1 (wrapper included).
 
 ```bash
-# Generate the gradle wrapper (only needed once)
-gradle wrapper --gradle-version 8.12
-
-# Build just this provider
+# The gradle wrapper is committed to the repo, so no local Gradle install needed.
 ./gradlew :AnimeWorld:make
 # → AnimeWorld/build/AnimeWorld.cs3
 
